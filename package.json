@@ -1,0 +1,20 @@
+{
+  "name": "2ndbrain",
+  "version": "2026.1.30",
+  "description": "An always-on Node.js npx service that bridges Telegram messges to Claude with\r * persistent conversation history (logs)\r * receive text messages w/ attachments\r * slash commands\r * send text message responses w/ \"Typing\" indicator\r * whitelist users that it will interact with (multi-layered)\r * can run local commands, access local postgres (mcp) (whitelisted)",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/fingerskier/2ndbrain.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/fingerskier/2ndbrain/issues"
+  },
+  "homepage": "https://github.com/fingerskier/2ndbrain#readme"
+}
