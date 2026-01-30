@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(dir:*)",
+      "Bash(git -C \"c:/dev/fingerskier/agent/2ndbrain\" log --oneline --all)",
+      "Bash(tree:*)",
+      "Bash(claude mcp call:*)",
+      "Bash(claude)",
+      "WebFetch(domain:docs.x.ai)",
+      "WebFetch(domain:api.x.ai)",
+      "WebFetch(domain:latenode.com)",
+      "Bash(claude:*)",
+      "Bash(printf:*)"
+    ]
+  }
+}

@@ -54,6 +54,7 @@ Enter slash commands in Telegram messages to perform tasks
   * Nodes(id, created, updated, name, note)
   * Edges(id, created, updated, node1_id, node2_id, name)
 * Journal(id, created, updated, note)
+* History(id, created, updated, user_id, message_id, content)
 * Logs(id, timestamp, content, level)
 * Embeddings(id, created, updated, entity_type, vector)
 
@@ -67,4 +68,3 @@ Hooks <TBD>
 ## Caveats
 
 * Run Claude w/ top model, thinking, ?accept edits?
-
