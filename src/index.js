@@ -20,7 +20,7 @@ import path from 'node:path';
 import fs from 'node:fs';
 
 import { config, validateConfig, isFirstRun, PROJECT_ROOT } from './config.js';
-import { pool, query, close as closeDb } from './db/pool.js';
+import { pool, query, close as closeDb, ensureDatabase } from './db/pool.js';
 import { migrate } from './db/migrate.js';
 import logger from './logging.js';
 import { createRateLimiters } from './rate-limiter.js';
@@ -329,6 +329,7 @@ async function main() {
   let dbReady = false;
   if (config.DATABASE_URL) {
     try {
+      await ensureDatabase();
       await pool.query('SELECT 1');
       logger.info('startup', 'Database connection established.');
       dbReady = true;

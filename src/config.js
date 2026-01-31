@@ -60,6 +60,19 @@ const config = {
   EMBEDDING_BASE_URL: env.EMBEDDING_BASE_URL || '',
 };
 
+// Ensure DATABASE_URL includes a database name (default: 2ndbrain)
+if (config.DATABASE_URL) {
+  try {
+    const url = new URL(config.DATABASE_URL);
+    if (!url.pathname || url.pathname === '/') {
+      url.pathname = '/2ndbrain';
+      config.DATABASE_URL = url.toString();
+    }
+  } catch {
+    // leave as-is if URL parsing fails
+  }
+}
+
 const REQUIRED_VARS = ['TELEGRAM_BOT_TOKEN', 'TELEGRAM_ALLOWED_USERS', 'DATABASE_URL'];
 
 /**

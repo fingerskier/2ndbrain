@@ -187,8 +187,10 @@ class WebServer {
         'SELECT COUNT(*)::int AS count FROM conversation_messages',
       );
       data.messageCount = countRes.rows[0]?.count ?? 0;
-    } catch {
+    } catch (err) {
       data.dbAvailable = false;
+      data.dbError = diagnosePgError(err);
+      this._logger.error('web', `Dashboard DB error: ${err.message} (code=${err.code || 'none'})`);
     }
 
     if (data.dbAvailable) {
@@ -299,14 +301,19 @@ class WebServer {
 
     try {
       await this._db.query('SELECT 1');
-    } catch {
-      health.components.database = 'error';
+    } catch (err) {
+      health.components.database = {
+        status: 'error',
+        error: err.message || 'Unknown error',
+        code: err.code || undefined,
+      };
     }
 
     // Derive overall status from component states
     const states = Object.values(health.components);
-    if (states.includes('error')) {
-      health.status = states.every((s) => s === 'error') ? 'error' : 'degraded';
+    const isErr = (s) => s === 'error' || (typeof s === 'object' && s.status === 'error');
+    if (states.some(isErr)) {
+      health.status = states.every(isErr) ? 'error' : 'degraded';
     }
 
     const httpStatus = health.status === 'error' ? 503 : 200;
@@ -351,7 +358,7 @@ class WebServer {
 
       const tablesResult = await this._db.query(`
         SELECT
-          relname AS name,
+          c.relname AS name,
           n_live_tup AS row_count,
           pg_size_pretty(pg_total_relation_size(c.oid)) AS size
         FROM pg_class c
@@ -372,7 +379,9 @@ class WebServer {
       data.dbSize = sizeResult.rows[0]?.size || '';
     } catch (err) {
       data.dbAvailable = false;
-      this._logger.error('web', `Database page error: ${err.message}`);
+      data.dbError = diagnosePgError(err);
+      data.dbUrl = maskDatabaseUrl(this._config.DATABASE_URL);
+      this._logger.error('web', `Database page error: ${err.message} (code=${err.code || 'none'})`);
     }
 
     res.send(databaseHTML(data));
@@ -497,6 +506,83 @@ function maskValue(value) {
   const s = String(value);
   if (s.length <= 8) return '*'.repeat(s.length);
   return s.slice(0, 4) + '*'.repeat(Math.min(s.length - 8, 20)) + s.slice(-4);
+}
+
+/** Mask the password in a PostgreSQL connection URL for safe display. */
+function maskDatabaseUrl(url) {
+  if (!url) return '(not set)';
+  const schemeEnd = url.indexOf('://');
+  const lastAt = url.lastIndexOf('@');
+  if (schemeEnd >= 0 && lastAt > schemeEnd) {
+    const userInfo = url.slice(schemeEnd + 3, lastAt);
+    const colonPos = userInfo.indexOf(':');
+    if (colonPos >= 0) {
+      return url.slice(0, schemeEnd + 3 + colonPos + 1) + '****' + url.slice(lastAt);
+    }
+  }
+  return maskValue(url);
+}
+
+/**
+ * Extract diagnostic information from a pg / Node.js connection error.
+ * Returns { message, code, detail, hint, diagnosis }.
+ */
+function diagnosePgError(err) {
+  const info = {
+    message: err.message || 'Unknown error',
+    code: err.code || '',
+    detail: err.detail || '',
+    hint: err.hint || '',
+    diagnosis: '',
+  };
+
+  switch (err.code) {
+    case 'ECONNREFUSED':
+      info.diagnosis = 'Cannot connect to the database server. Verify the host and port are correct and that PostgreSQL is running.';
+      break;
+    case 'ENOTFOUND':
+      info.diagnosis = 'DNS lookup failed. The database hostname could not be resolved. Check the host in your DATABASE_URL.';
+      break;
+    case 'ETIMEDOUT':
+      info.diagnosis = 'Connection timed out. The database server may be unreachable or behind a firewall.';
+      break;
+    case 'ECONNRESET':
+      info.diagnosis = 'Connection was reset by the server. This may indicate a network issue or server restart.';
+      break;
+    default:
+      break;
+  }
+
+  if (!info.diagnosis && typeof err.code === 'string' && err.code.length === 5) {
+    const cls = err.code.substring(0, 2);
+    switch (cls) {
+      case '08':
+        info.diagnosis = 'Connection exception. The database server rejected or dropped the connection.';
+        break;
+      case '28':
+        info.diagnosis = 'Authentication failed. Check the username and password in your DATABASE_URL.';
+        break;
+      case '3D':
+        info.diagnosis = 'The specified database does not exist. Verify the database name in your DATABASE_URL.';
+        break;
+      case '53':
+        info.diagnosis = 'The database server has insufficient resources (too many connections, out of memory, or disk full).';
+        break;
+      case '57':
+        info.diagnosis = 'The database server is shutting down or not accepting connections.';
+        break;
+      default:
+        break;
+    }
+  }
+
+  if (!info.diagnosis && err.message) {
+    if (/ssl/i.test(err.message) || /certificate/i.test(err.message)) {
+      info.diagnosis = 'SSL/TLS error. Check your SSL configuration or try adding ?sslmode=require or ?sslmode=no-verify to your DATABASE_URL.';
+    }
+  }
+
+  return info;
 }
 
 // ---------------------------------------------------------------------------
@@ -670,6 +756,28 @@ function layoutHTML(title, content) {
     font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
     margin-bottom: 0.25rem;
   }
+  .secret-input-wrapper {
+    position: relative;
+  }
+  .secret-input-wrapper input {
+    padding-right: 2.5rem;
+  }
+  .secret-toggle {
+    position: absolute;
+    right: 0.4rem;
+    top: 50%;
+    transform: translateY(-50%);
+    background: none;
+    border: none;
+    color: #8b949e;
+    cursor: pointer;
+    padding: 0.2rem;
+    font-size: 0.85rem;
+    line-height: 1;
+  }
+  .secret-toggle:hover {
+    color: #c9d1d9;
+  }
   .checkbox-group {
     display: flex;
     align-items: center;
@@ -828,9 +936,17 @@ function dashboardHTML(data) {
   </div>`;
 
   // -- DB warning ----------------------------------------------------------
-  const dbWarn = data.dbAvailable
-    ? ''
-    : '<div class="db-warn">Database is unavailable. Dashboard data may be incomplete.</div>';
+  let dbWarn = '';
+  if (!data.dbAvailable) {
+    const e = data.dbError || {};
+    dbWarn = '<div class="db-warn">Database is unavailable. Dashboard data may be incomplete.';
+    if (e.diagnosis) {
+      dbWarn += `<br><span style="font-size:0.82rem;">${esc(e.diagnosis)}</span>`;
+    } else if (e.message) {
+      dbWarn += `<br><span style="font-size:0.82rem;">${esc(e.message)}</span>`;
+    }
+    dbWarn += '</div>';
+  }
 
   // -- Recent messages -----------------------------------------------------
   let messagesSection;
@@ -900,15 +1016,23 @@ function settingsHTML(config, message) {
       let inputArea;
 
       if (field.secret) {
+        const maskedDisplay = field.key === 'DATABASE_URL'
+          ? maskDatabaseUrl(String(value))
+          : maskValue(String(value));
         const status = value
-          ? `Current: ${esc(maskValue(String(value)))}`
+          ? `Current: ${esc(maskedDisplay)}`
           : '(not set)';
         inputArea = `
           <div>
             <div class="secret-current">${status}</div>
-            <input type="password" name="${esc(field.key)}"
-                   value="" placeholder="Enter new value to change"
-                   autocomplete="off" />
+            <div class="secret-input-wrapper">
+              <input type="password" id="input-${esc(field.key)}" name="${esc(field.key)}"
+                     value="" placeholder="Enter new value to change"
+                     autocomplete="off" />
+              <button type="button" class="secret-toggle"
+                      onclick="const inp=document.getElementById('input-${esc(field.key)}');const show=inp.type==='password';inp.type=show?'text':'password';this.textContent=show?'&#x25C9;':'&#x25CE;';"
+                      title="Toggle visibility">&#x25CE;</button>
+            </div>
           </div>`;
       } else if (field.type === 'boolean') {
         const checked = String(value).toLowerCase() === 'true' ? ' checked' : '';
@@ -991,9 +1115,29 @@ function databaseHTML(data) {
     ? `<div class="alert alert-${esc(data.message.type)}">${esc(data.message.text)}</div>`
     : '';
 
-  const dbWarn = data.dbAvailable
-    ? ''
-    : '<div class="db-warn">Database is unavailable. Cannot retrieve database information.</div>';
+  let dbWarn = '';
+  if (!data.dbAvailable) {
+    const e = data.dbError || {};
+    dbWarn = '<div class="db-warn">';
+    dbWarn += '<strong>Database is unavailable.</strong> Cannot retrieve database information.';
+    if (e.diagnosis) {
+      dbWarn += `<br><br><strong>Diagnosis:</strong> ${esc(e.diagnosis)}`;
+    }
+    dbWarn += `<br><br><strong>Error:</strong> ${esc(e.message || 'Unknown')}`;
+    if (e.code) {
+      dbWarn += ` <span class="muted">(code: ${esc(e.code)})</span>`;
+    }
+    if (e.detail) {
+      dbWarn += `<br><strong>Detail:</strong> ${esc(e.detail)}`;
+    }
+    if (e.hint) {
+      dbWarn += `<br><strong>Hint:</strong> ${esc(e.hint)}`;
+    }
+    if (data.dbUrl) {
+      dbWarn += `<br><br><strong>Connection URL:</strong> <code style="font-size:0.82rem;">${esc(data.dbUrl)}</code>`;
+    }
+    dbWarn += '</div>';
+  }
 
   const stats = data.dbAvailable
     ? `
