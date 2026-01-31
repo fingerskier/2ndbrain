@@ -1,6 +1,6 @@
 {
   "name": "2ndbrain",
-  "version": "0.5.0",
+  "version": "2026.1.31",
   "description": "Always-on Node.js service bridging Telegram messaging to Claude AI with knowledge graph, journal, project management, and semantic search.",
   "main": "src/index.js",
   "bin": {
@@ -17,7 +17,7 @@
   },
   "keywords": ["telegram", "claude", "ai", "assistant", "knowledge-graph"],
   "author": "",
-  "license": "ISC",
+  "license": "MIT",
   "bugs": {
     "url": "https://github.com/fingerskier/2ndbrain/issues"
   },
