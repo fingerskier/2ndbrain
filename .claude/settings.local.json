@@ -10,7 +10,8 @@
       "WebFetch(domain:api.x.ai)",
       "WebFetch(domain:latenode.com)",
       "Bash(claude:*)",
-      "Bash(printf:*)"
+      "Bash(printf:*)",
+      "Bash(ls -la \"c:\\\\dev\\\\fingerskier\\\\agent\\\\2ndbrain\\\\db\\\\migrations\"\" 2>/dev/null || echo \"No migrations directory \")"
     ]
   }
 }

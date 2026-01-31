@@ -3,6 +3,7 @@ import { createServer } from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { migrate, getMigrationFiles, ensureMigrationsTable } from '../db/migrate.js';
 
 // Resolve project root (two directories up from src/web/)
 const __filename = fileURLToPath(import.meta.url);
@@ -31,7 +32,7 @@ const SETTINGS_FIELDS = [
     section: 'Claude',
     fields: [
       { key: 'CLAUDE_MODEL', label: 'Model', hint: 'Default: claude-sonnet-4-20250514' },
-      { key: 'CLAUDE_THINKING', label: 'Thinking', hint: 'Enable extended thinking (true/false)' },
+      { key: 'CLAUDE_THINKING', label: 'Thinking', type: 'boolean', hint: 'Enable extended thinking' },
       { key: 'CLAUDE_TIMEOUT', label: 'Timeout (ms)', hint: 'Default: 120000' },
       { key: 'CLAUDE_MAX_BUDGET', label: 'Max Budget (USD)', hint: 'Max cost per invocation (e.g. 0.50)' },
     ],
@@ -74,7 +75,7 @@ const SETTINGS_FIELDS = [
     fields: [
       { key: 'WEB_PORT', label: 'Port', hint: 'Default: 3000' },
       { key: 'WEB_BIND', label: 'Bind Address', hint: 'Default: 127.0.0.1' },
-      { key: 'AUTO_OPEN_BROWSER', label: 'Auto Open Browser', hint: 'true/false (default: true)' },
+      { key: 'AUTO_OPEN_BROWSER', label: 'Auto Open Browser', type: 'boolean', hint: 'Default: true' },
     ],
   },
   {
@@ -127,6 +128,8 @@ class WebServer {
     app.post('/settings', (req, res) => this._handleSaveSettings(req, res));
     app.get('/logs', (req, res) => this._handleLogs(req, res));
     app.get('/health', (req, res) => this._handleHealth(req, res));
+    app.get('/database', (req, res) => this._handleDatabase(req, res));
+    app.post('/database/migrate', (req, res) => this._handleRunMigrations(req, res));
 
     // Start listening
     const server = createServer(app);
@@ -308,6 +311,86 @@ class WebServer {
 
     const httpStatus = health.status === 'error' ? 503 : 200;
     res.status(httpStatus).json(health);
+  }
+
+  // -----------------------------------------------------------------------
+  // Database page
+  // -----------------------------------------------------------------------
+
+  async _handleDatabase(req, res) {
+    const data = {
+      dbAvailable: true,
+      migrations: { applied: [], pending: [], total: 0 },
+      tables: [],
+      dbVersion: '',
+      dbSize: '',
+      message: null,
+    };
+
+    if (req.query.migrated) {
+      const count = parseInt(req.query.migrated, 10) || 0;
+      data.message = { type: 'success', text: `Successfully applied ${count} migration(s).` };
+    } else if (req.query.error) {
+      data.message = { type: 'error', text: req.query.error };
+    } else if (req.query.noop === '1') {
+      data.message = { type: 'success', text: 'No pending migrations to apply.' };
+    }
+
+    try {
+      await ensureMigrationsTable();
+
+      const appliedResult = await this._db.query(
+        'SELECT name, applied_at FROM schema_migrations ORDER BY name',
+      );
+      const appliedSet = new Set(appliedResult.rows.map((r) => r.name));
+      const allFiles = getMigrationFiles();
+
+      data.migrations.applied = appliedResult.rows;
+      data.migrations.pending = allFiles.filter((f) => !appliedSet.has(f));
+      data.migrations.total = allFiles.length;
+
+      const tablesResult = await this._db.query(`
+        SELECT
+          relname AS name,
+          n_live_tup AS row_count,
+          pg_size_pretty(pg_total_relation_size(c.oid)) AS size
+        FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        LEFT JOIN pg_stat_user_tables s ON s.relid = c.oid
+        WHERE n.nspname = 'public'
+          AND c.relkind = 'r'
+        ORDER BY pg_total_relation_size(c.oid) DESC
+      `);
+      data.tables = tablesResult.rows;
+
+      const versionResult = await this._db.query('SELECT version()');
+      data.dbVersion = versionResult.rows[0]?.version || '';
+
+      const sizeResult = await this._db.query(
+        'SELECT pg_size_pretty(pg_database_size(current_database())) AS size',
+      );
+      data.dbSize = sizeResult.rows[0]?.size || '';
+    } catch (err) {
+      data.dbAvailable = false;
+      this._logger.error('web', `Database page error: ${err.message}`);
+    }
+
+    res.send(databaseHTML(data));
+  }
+
+  async _handleRunMigrations(_req, res) {
+    try {
+      const applied = await migrate();
+      if (applied.length === 0) {
+        res.redirect('/database?noop=1');
+      } else {
+        this._logger.info('web', `Applied ${applied.length} migration(s) via web admin.`);
+        res.redirect(`/database?migrated=${applied.length}`);
+      }
+    } catch (err) {
+      this._logger.error('web', `Migration failed via web admin: ${err.message}`);
+      res.redirect(`/database?error=${encodeURIComponent(err.message)}`);
+    }
   }
 
   // -----------------------------------------------------------------------
@@ -587,6 +670,24 @@ function layoutHTML(title, content) {
     font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
     margin-bottom: 0.25rem;
   }
+  .checkbox-group {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding-top: 0.35rem;
+  }
+  .checkbox-group input[type="checkbox"] {
+    width: 1.1rem;
+    height: 1.1rem;
+    accent-color: #238636;
+    cursor: pointer;
+  }
+  .checkbox-label {
+    font-size: 0.85rem;
+    color: #8b949e;
+    padding-top: 0;
+    cursor: pointer;
+  }
   button[type="submit"] {
     background: #238636;
     color: #fff;
@@ -680,6 +781,7 @@ function layoutHTML(title, content) {
   <a href="/">Dashboard</a>
   <a href="/settings">Settings</a>
   <a href="/logs">Logs</a>
+  <a href="/database">Database</a>
 </nav>
 <div class="container">
 ${content}
@@ -808,6 +910,15 @@ function settingsHTML(config, message) {
                    value="" placeholder="Enter new value to change"
                    autocomplete="off" />
           </div>`;
+      } else if (field.type === 'boolean') {
+        const checked = String(value).toLowerCase() === 'true' ? ' checked' : '';
+        inputArea = `
+          <div class="checkbox-group">
+            <input type="hidden" name="${esc(field.key)}" value="false" />
+            <input type="checkbox" id="${esc(field.key)}" name="${esc(field.key)}"
+                   value="true"${checked} />
+            <label for="${esc(field.key)}" class="checkbox-label">Enabled</label>
+          </div>`;
       } else {
         inputArea = `<input type="text" name="${esc(field.key)}"
                             value="${esc(String(value))}" />`;
@@ -869,6 +980,134 @@ function logsHTML(logs, activeLevel) {
     <h1>Logs</h1>
     <div class="log-filters">${filters}</div>
     <div class="card">${body}</div>
+  `);
+}
+
+/**
+ * Database admin page showing migration status and table metadata.
+ */
+function databaseHTML(data) {
+  const alert = data.message
+    ? `<div class="alert alert-${esc(data.message.type)}">${esc(data.message.text)}</div>`
+    : '';
+
+  const dbWarn = data.dbAvailable
+    ? ''
+    : '<div class="db-warn">Database is unavailable. Cannot retrieve database information.</div>';
+
+  const stats = data.dbAvailable
+    ? `
+  <div class="grid">
+    <div class="card">
+      <div class="stat-label">Total Migrations</div>
+      <div class="stat-value">${data.migrations.total}</div>
+    </div>
+    <div class="card">
+      <div class="stat-label">Applied</div>
+      <div class="stat-value" style="color:#3fb950;">${data.migrations.applied.length}</div>
+    </div>
+    <div class="card">
+      <div class="stat-label">Pending</div>
+      <div class="stat-value"${data.migrations.pending.length > 0 ? ' style="color:#d29922;"' : ''}>${data.migrations.pending.length}</div>
+    </div>
+    <div class="card">
+      <div class="stat-label">Database Size</div>
+      <div class="stat-value">${esc(data.dbSize)}</div>
+    </div>
+  </div>`
+    : '';
+
+  const versionSection = data.dbVersion
+    ? `<p class="muted" style="margin-bottom:1rem;font-size:0.82rem;">${esc(data.dbVersion)}</p>`
+    : '';
+
+  let pendingSection = '';
+  if (data.dbAvailable && data.migrations.pending.length > 0) {
+    const pendingRows = data.migrations.pending
+      .map(
+        (name) => `
+      <tr>
+        <td><span class="badge badge-warn">pending</span></td>
+        <td style="font-family:monospace;">${esc(name)}</td>
+        <td class="muted">--</td>
+      </tr>`,
+      )
+      .join('');
+
+    pendingSection = `
+    <h2>Pending Migrations</h2>
+    <div class="card" style="overflow-x:auto;">
+      <table>
+        <thead><tr><th>Status</th><th>Migration</th><th>Applied At</th></tr></thead>
+        <tbody>${pendingRows}</tbody>
+      </table>
+      <form method="POST" action="/database/migrate"
+            onsubmit="return confirm('Run ${data.migrations.pending.length} pending migration(s)?\\n\\nThis will modify the database schema.');"
+            style="margin-top:1rem;">
+        <button type="submit" style="background:#d29922;">Run ${data.migrations.pending.length} Pending Migration${data.migrations.pending.length === 1 ? '' : 's'}</button>
+      </form>
+    </div>`;
+  }
+
+  let appliedSection = '';
+  if (data.dbAvailable && data.migrations.applied.length > 0) {
+    const appliedRows = data.migrations.applied
+      .map(
+        (m) => `
+      <tr>
+        <td><span class="badge badge-ok">applied</span></td>
+        <td style="font-family:monospace;">${esc(m.name)}</td>
+        <td>${fmtTime(m.applied_at)}</td>
+      </tr>`,
+      )
+      .join('');
+
+    appliedSection = `
+    <h2>Applied Migrations</h2>
+    <div class="card" style="overflow-x:auto;">
+      <table>
+        <thead><tr><th>Status</th><th>Migration</th><th>Applied At</th></tr></thead>
+        <tbody>${appliedRows}</tbody>
+      </table>
+    </div>`;
+  } else if (data.dbAvailable && data.migrations.applied.length === 0) {
+    appliedSection = `
+    <h2>Applied Migrations</h2>
+    <div class="card"><p class="empty">No migrations have been applied yet.</p></div>`;
+  }
+
+  let tablesSection = '';
+  if (data.dbAvailable && data.tables.length > 0) {
+    const tableRows = data.tables
+      .map(
+        (t) => `
+      <tr>
+        <td style="font-family:monospace;">${esc(t.name)}</td>
+        <td style="text-align:right;">${t.row_count ?? '--'}</td>
+        <td style="text-align:right;">${esc(t.size)}</td>
+      </tr>`,
+      )
+      .join('');
+
+    tablesSection = `
+    <h2>Tables</h2>
+    <div class="card" style="overflow-x:auto;">
+      <table>
+        <thead><tr><th>Table</th><th style="text-align:right;">Rows (est.)</th><th style="text-align:right;">Size</th></tr></thead>
+        <tbody>${tableRows}</tbody>
+      </table>
+    </div>`;
+  }
+
+  return layoutHTML('Database', `
+    <h1>Database</h1>
+    ${alert}
+    ${dbWarn}
+    ${versionSection}
+    ${stats}
+    ${pendingSection}
+    ${appliedSection}
+    ${tablesSection}
   `);
 }
 

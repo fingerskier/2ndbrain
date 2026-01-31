@@ -90,5 +90,5 @@ async function migrate() {
   return newlyApplied;
 }
 
-export { migrate };
+export { migrate, getAppliedMigrations, getMigrationFiles, ensureMigrationsTable };
 export default migrate;
