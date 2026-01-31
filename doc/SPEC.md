@@ -719,8 +719,8 @@ After=network.target postgresql.service
 
 [Service]
 Type=simple
-User=pi
-EnvironmentFile=/home/pi/.env
+User={SYSTEM_USER}
+EnvironmentFile=/home/{SYSTEM_USER}/.env
 Environment=AUTO_OPEN_BROWSER=false
 ExecStart=/usr/bin/npx 2ndbrain
 Restart=on-failure
