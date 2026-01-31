@@ -57,6 +57,86 @@ No other tools are permitted for this skill.
 
 ## Operations
 
+### List All Projects (No Arguments)
+
+When the user sends `/project` with no additional text, list all projects with status:
+
+```sql
+SELECT
+  p.id,
+  p.name,
+  p.created_at,
+  COUNT(i.id) FILTER (WHERE NOT i.completed) AS open_issues,
+  COUNT(i.id) FILTER (WHERE i.completed) AS closed_issues,
+  COUNT(DISTINCT s.id) AS spec_count
+FROM projects p
+LEFT JOIN issues i ON i.project_id = p.id
+LEFT JOIN specifications s ON s.project_id = p.id
+GROUP BY p.id, p.name, p.created_at
+ORDER BY p.updated_at DESC;
+```
+
+Present as a concise listing. If no projects exist, respond: "No projects found. Send `/project <description>` to create one."
+
+### Parse and Scaffold from Description
+
+When the user sends `/project` followed by a natural language description, parse it and create the appropriate database records:
+
+1. **Extract the project name** from the description. Use the most prominent noun phrase or explicit project name.
+
+2. **Check for existing project** (case-insensitive):
+
+```sql
+SELECT id, name FROM projects WHERE name ILIKE '%project name%';
+```
+
+   - If a match exists, use the existing project ID (do not create a duplicate).
+   - If multiple matches, list them and ask the user to clarify.
+   - If no match, create a new project.
+
+3. **Extract specifications** -- any requirements, constraints, architecture decisions, API contracts, or design notes from the description. Insert each:
+
+```sql
+INSERT INTO specifications (project_id, note)
+VALUES (<project_id>, 'extracted specification')
+RETURNING id, note;
+```
+
+   Use `parent_id` when specifications have a natural parent-child hierarchy.
+
+4. **Extract issues/tasks** -- any action items, features to build, bugs to fix, or work items. Insert each:
+
+```sql
+INSERT INTO issues (project_id, note)
+VALUES (<project_id>, 'extracted task or issue')
+RETURNING id, note;
+```
+
+   Use `parent_id` when tasks have a natural hierarchy.
+
+5. **Upsert behavior:** Before inserting a specification or issue, check if one with very similar text already exists for this project:
+
+```sql
+SELECT id, note FROM specifications WHERE project_id = <project_id> AND note ILIKE '%key phrase%';
+SELECT id, note FROM issues WHERE project_id = <project_id> AND note ILIKE '%key phrase%';
+```
+
+   If a match exists, skip it (note as "already exists" in the summary). Do not delete existing records.
+
+6. **Respond with a summary** of everything created or found:
+
+```
+Project: <name> (id: <id>) [created | existing]
+
+Specifications:
+- <spec note> (id: <id>)
+- <spec note> (id: <id>) [already exists]
+
+Issues:
+- <issue note> (id: <id>)
+- <issue note> (id: <id>) [already exists]
+```
+
 ### Create a Project
 
 When the user wants to start tracking a new project.

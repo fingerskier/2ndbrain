@@ -34,6 +34,7 @@ import { createEmbedTool } from './mcp/embed-server.js';
 import { AttachmentStore } from './attachments/store.js';
 import { EmbeddingsEngine } from './embeddings/engine.js';
 import { EmbeddingWorker } from './embeddings/worker.js';
+import { SchedulerWorker } from './scheduler/worker.js';
 import { WebServer } from './web/server.js';
 
 // ---------------------------------------------------------------------------
@@ -44,6 +45,7 @@ const startTime = Date.now();
 let bot = null;
 let webServer = null;
 let embeddingWorker = null;
+let schedulerWorker = null;
 let embedTool = null;
 let shuttingDown = false;
 
@@ -178,6 +180,7 @@ async function handleMessage(message, deps) {
       message: text,
       systemPrompt: '',
       sessionId: conversationManager.currentSessionId,
+      chatId,
     });
 
     if (preResult.aborted) {
@@ -294,6 +297,10 @@ async function shutdown(signal) {
 
   if (embeddingWorker) {
     try { embeddingWorker.stop(); } catch { /* ignore */ }
+  }
+
+  if (schedulerWorker) {
+    try { schedulerWorker.stop(); } catch { /* ignore */ }
   }
 
   if (embedTool?.server) {
@@ -514,6 +521,19 @@ async function main() {
   if (embeddingsEngine.isEnabled() && dbReady) {
     embeddingWorker = new EmbeddingWorker({ db: { query }, config, logger });
     embeddingWorker.start();
+  }
+
+  // Start background scheduler worker
+  if (dbReady && bot) {
+    schedulerWorker = new SchedulerWorker({
+      db: { query },
+      config,
+      logger,
+      claudeBridge,
+      bot,
+      rateLimiters,
+    });
+    schedulerWorker.start();
   }
 
   // Step 8: Set signal handlers

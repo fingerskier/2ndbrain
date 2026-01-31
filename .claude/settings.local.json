@@ -14,7 +14,8 @@
       "Bash(ls -la \"c:\\\\dev\\\\fingerskier\\\\agent\\\\2ndbrain\\\\db\\\\migrations\"\" 2>/dev/null || echo \"No migrations directory \")",
       "Bash(node:*)",
       "Bash(ls -la \"c:\\\\dev\\\\fingerskier\\\\agent\\\\2ndbrain\\\\src\\\\web\"\" 2>/dev/null || echo \"web directory not found \")",
-      "Bash(ls -la \"c:\\\\dev\\\\fingerskier\\\\agent\\\\2ndbrain\\\\db\"\" 2>/dev/null || echo \"Directory not accessible \")"
+      "Bash(ls -la \"c:\\\\dev\\\\fingerskier\\\\agent\\\\2ndbrain\\\\db\"\" 2>/dev/null || echo \"Directory not accessible \")",
+      "Bash(npm install:*)"
     ]
   }
 }

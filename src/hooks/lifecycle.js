@@ -239,6 +239,11 @@ class LifecycleHooks extends EventEmitter {
         ctx.systemPrompt = dateContext;
       }
 
+      // Inject chat_id for skills that need it (e.g., scheduler)
+      if (ctx.chatId) {
+        ctx.systemPrompt += `\nCurrent Telegram chat_id: ${ctx.chatId}`;
+      }
+
       // Assemble conversation context from recent history if db is available
       if (db && ctx.includeHistory !== false) {
         try {

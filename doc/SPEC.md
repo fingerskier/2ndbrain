@@ -103,6 +103,7 @@ See also: §4 (Command Router), §8 (Attachment Store), §14 (Security Model), �
 
 Parses incoming messages and routes them:
 - Messages prefixed with `/` are dispatched to slash command handlers
+- Pass-through commands are forwarded to the Claude Bridge where the corresponding skill handles them (§12)
 - All other messages are forwarded to the Claude Bridge (§5)
 
 ### Slash Commands
@@ -115,11 +116,17 @@ Parses incoming messages and routes them:
 | `/restart` | none | Process restart | Confirmation prompt; on confirm, restart process |
 | `/reboot` | none | OS reboot | Confirmation prompt; on confirm, `sudo reboot` |
 | `/new` | none | Start new conversation session | Confirmation; old session preserved in logs |
+| `/project` | optional description | Manage projects, specs, issues | Pass-through to Claude (§12, `project-manage` skill) |
+| `/journal` | optional text | Record or search journal entries | Pass-through to Claude (§12, `journal` skill) |
+| `/knowledge` | optional text | Manage knowledge graph | Pass-through to Claude (§12, `knowledge` skill) |
+| `/schedule` | optional description | Create, list, or manage scheduled tasks | Pass-through to Claude (§12, `scheduler` skill) |
 | `/help` | none | List available commands | Command list with descriptions |
 
 `/restart` and `/reboot` require explicit confirmation reply before execution (see §14.4). `/new` starts a fresh Claude session; the previous session remains accessible in logs and search.
 
-See also: §5 (Claude Bridge), §14.4 (Dangerous Operations)
+**Pass-through commands** (`/project`, `/journal`, `/knowledge`, `/schedule`) are recognized by the command router but not handled locally. Instead, the full message text is forwarded to the Claude Bridge as a conversational message. The corresponding Claude skill (§12) activates on the `/command` prefix and performs the database operations. Pass-through commands go through the normal message flow including rate limiting, conversation persistence, and lifecycle hooks.
+
+See also: §5 (Claude Bridge), §12 (Claude Skills), §14.4 (Dangerous Operations)
 
 
 ## 5. Claude Bridge
@@ -315,6 +322,31 @@ Structured operational logs are written to the `system_logs` table with level (`
 
 See also: §9 (Web Admin Server), §15 (Error Handling), §17.1 (`system_logs` table), §18 (rate limit and log variables)
 
+### 10.2 Scheduler Worker
+
+Background service that executes scheduled tasks defined in the `scheduled_tasks` table (§17.7).
+
+| Property | Value |
+|----------|-------|
+| Poll interval | 60 seconds |
+| Max tasks per tick | 3 |
+| Auto-disable threshold | 5 consecutive errors |
+| Pattern | `EmbeddingWorker` (setTimeout-based polling loop) |
+
+**Execution flow:**
+1. Poll `scheduled_tasks` for rows where `enabled = TRUE AND next_run_at <= NOW()`
+2. Check `ClaudeBridge.isActive()` -- skip if a user message is being processed
+3. Acquire Claude rate limiter slot
+4. Invoke `claude-cli` with the task's `task_prompt` (fresh session per execution)
+5. Deliver the response to the user's Telegram chat, prefixed with `[Scheduled: <description>]`
+6. Compute `next_run_at` using `node-cron` and update the row
+
+**Startup recovery:** On service start, recomputes `next_run_at` for all enabled tasks with NULL or past values. Tasks missed during downtime skip ahead to the next scheduled time (no retroactive execution).
+
+**Error handling:** Consecutive failures increment `error_count`. After 5 failures, the task is auto-disabled and the user is notified via Telegram. Re-enabling via `/schedule` resets the error count.
+
+See also: §12.2 (`scheduler` skill), §17.7 (`scheduled_tasks` table)
+
 
 ## 11. Knowledge Platform
 
@@ -403,6 +435,7 @@ $DATA_DIR/claude-runtime/.claude/skills/
   knowledge/SKILL.md
   project-manage/SKILL.md
   recall/SKILL.md
+  scheduler/SKILL.md
   system-ops/SKILL.md
 ```
 
@@ -506,6 +539,26 @@ Each skill is defined as a `SKILL.md` file containing natural-language instructi
 - **Recent errors:** `SELECT * FROM system_logs WHERE level = 'error' ORDER BY created_at DESC LIMIT 5`
 
 **Restrictions:** This skill provides read-only system access only. It does NOT support restart, reboot, shutdown, or any mutating operations. Those remain exclusive to slash commands with confirmation prompts (§4).
+
+#### `scheduler` -- Scheduled Task Management
+
+| Property | Value |
+|----------|-------|
+| Name | `scheduler` |
+| Description | Create, list, update, and delete scheduled tasks. Parse natural language schedules into cron expressions and persist them for automatic execution. |
+| Invocation | User sends message with `/schedule` preamble, or automatic (Claude detects scheduling intent: "every morning remind me to...", "schedule a daily check on...") |
+| Allowed tools | PostgreSQL MCP (`mcp__pg__query`) |
+| Tables | `scheduled_tasks` |
+
+**Behaviors:**
+- **Create task:** Parse natural language into a 5-field cron expression and task prompt. `INSERT INTO scheduled_tasks (chat_id, cron_expression, task_prompt, description, timezone) VALUES ($1, $2, $3, $4, $5)`. The `chat_id` is obtained from the system prompt context.
+- **List tasks:** `SELECT * FROM scheduled_tasks WHERE chat_id = $1 ORDER BY created_at DESC`
+- **Update task:** `UPDATE scheduled_tasks SET cron_expression = $1, task_prompt = $2, description = $3, next_run_at = NULL, updated_at = NOW() WHERE id = $4 AND chat_id = $5`. Setting `next_run_at = NULL` forces the scheduler worker to recompute it.
+- **Enable/disable:** `UPDATE scheduled_tasks SET enabled = $1, error_count = 0, updated_at = NOW() WHERE id = $2 AND chat_id = $3`
+- **Delete task:** `DELETE FROM scheduled_tasks WHERE id = $1 AND chat_id = $2`
+- **Search tasks:** `SELECT * FROM scheduled_tasks WHERE chat_id = $1 AND (description ILIKE $2 OR task_prompt ILIKE $2)`
+
+**Execution model:** The skill only manages task definitions in the database. Actual execution is performed by the `SchedulerWorker` background service (§10.2), which polls the `scheduled_tasks` table every 60 seconds and invokes `claude-cli` for tasks whose `next_run_at` has passed. After 5 consecutive execution failures, a task is auto-disabled and the user is notified.
 
 
 ## 13. Claude Hooks
@@ -862,6 +915,31 @@ CREATE TABLE embeddings (
 -- HNSW index for fast approximate nearest neighbor search (cosine distance)
 CREATE INDEX idx_embeddings_vector
   ON embeddings USING hnsw (vector vector_cosine_ops);
+```
+
+### 17.7 Scheduled Tasks
+
+```sql
+CREATE TABLE scheduled_tasks (
+  id              SERIAL PRIMARY KEY,
+  created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  chat_id         TEXT NOT NULL,                -- Telegram chat ID for delivering results
+  cron_expression TEXT NOT NULL,                -- Standard 5-field cron: min hour dom month dow
+  task_prompt     TEXT NOT NULL,                -- Prompt sent to Claude when the task fires
+  description     TEXT NOT NULL DEFAULT '',     -- Human-readable description
+  timezone        TEXT NOT NULL DEFAULT 'UTC',  -- IANA timezone (e.g. 'America/New_York')
+  enabled         BOOLEAN NOT NULL DEFAULT TRUE,
+  last_run_at     TIMESTAMPTZ,
+  next_run_at     TIMESTAMPTZ,                 -- Pre-computed by SchedulerWorker
+  error_count     INTEGER NOT NULL DEFAULT 0,   -- Consecutive error count for backoff
+  last_error      TEXT                          -- Last error message, if any
+);
+
+CREATE INDEX idx_scheduled_tasks_next_run
+  ON scheduled_tasks (next_run_at) WHERE enabled = TRUE;
+CREATE INDEX idx_scheduled_tasks_chat_id
+  ON scheduled_tasks (chat_id);
 ```
 
 

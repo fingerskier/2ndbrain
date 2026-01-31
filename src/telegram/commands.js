@@ -5,6 +5,13 @@ import { escapeMarkdownV2 } from './bot.js';
 const CONFIRMATION_TTL_MS = 60_000;
 
 /**
+ * Commands that are forwarded to Claude instead of handled by the router.
+ * The corresponding Claude skill activates on the `/command` prefix.
+ * @type {Set<string>}
+ */
+const PASSTHROUGH_COMMANDS = new Set(['/project', '/journal', '/knowledge', '/schedule']);
+
+/**
  * Descriptions shown by the /help command.
  * @type {Record<string, string>}
  */
@@ -15,6 +22,10 @@ const COMMAND_DESCRIPTIONS = {
   '/restart': 'Restart the service process',
   '/reboot': 'Reboot the host operating system',
   '/new': 'Start a new conversation session',
+  '/project': 'Manage projects, specs, and issues (handled by Claude)',
+  '/journal': 'Record and search journal entries (handled by Claude)',
+  '/knowledge': 'Manage knowledge graph (handled by Claude)',
+  '/schedule': 'Create, list, or manage scheduled tasks (handled by Claude)',
   '/help': 'List available commands',
 };
 
@@ -90,6 +101,11 @@ class CommandRouter {
 
     // Extract the command name (everything up to the first space or @)
     const command = trimmed.split(/[\s@]/)[0].toLowerCase();
+
+    // Skill-managed commands pass through to Claude
+    if (PASSTHROUGH_COMMANDS.has(command)) {
+      return false;
+    }
 
     const replyOpts = { reply_to_message_id: messageId, parse_mode: undefined };
 
@@ -436,5 +452,5 @@ class CommandRouter {
   }
 }
 
-export { CommandRouter, COMMAND_DESCRIPTIONS };
+export { CommandRouter, COMMAND_DESCRIPTIONS, PASSTHROUGH_COMMANDS };
 export default CommandRouter;
