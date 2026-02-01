@@ -504,6 +504,11 @@ async function main() {
       embeddingsEngine,
     };
 
+    // Catch emitted errors so they don't throw (Node.js EventEmitter behaviour)
+    bot.on('error', (err) => {
+      logger.error('telegram', `Bot error: ${err.message}`);
+    });
+
     // Wire message handler
     bot.on('message', (msg) => {
       handleMessage(msg, deps).catch((err) => {

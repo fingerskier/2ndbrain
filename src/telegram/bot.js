@@ -261,7 +261,7 @@ class TelegramBot extends EventEmitter {
    * @returns {Promise<object[]>} Array of sent message results
    */
   async sendMessage(chatId, text, options = {}) {
-    const parseMode = options.parse_mode ?? 'MarkdownV2';
+    const parseMode = 'parse_mode' in options ? options.parse_mode : 'MarkdownV2';
     const chunks = this._chunkText(text, MAX_MESSAGE_LENGTH);
     const results = [];
 
