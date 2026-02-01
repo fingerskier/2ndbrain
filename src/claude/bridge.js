@@ -1,5 +1,6 @@
 import { spawn } from 'node:child_process';
 import { EventEmitter } from 'node:events';
+import path from 'node:path';
 
 /**
  * Claude CLI subprocess bridge (spec section 5).
@@ -41,9 +42,14 @@ class ClaudeBridge extends EventEmitter {
     const startTime = Date.now();
     const args = this._buildArgs(sessionId, systemPrompt);
 
+    this.logger.info('claude', `Spawning: claude ${args.join(' ')}`);
+
+    const runtimeDir = path.join(this.config.DATA_DIR, 'claude-runtime');
+
     return new Promise((resolve, reject) => {
       const proc = spawn('claude', args, {
         stdio: ['pipe', 'pipe', 'pipe'],
+        cwd: runtimeDir,
         env: { ...process.env },
       });
 
@@ -55,6 +61,19 @@ class ClaudeBridge extends EventEmitter {
       const toolCalls = [];
       let resultData = null;
       let timedOut = false;
+      let receivedFirstOutput = false;
+
+      // Startup watchdog: warn if no stdout arrives within 30s
+      const startupTimeout = setTimeout(() => {
+        if (!receivedFirstOutput) {
+          this.logger.warn(
+            'claude',
+            'No output received from Claude CLI within 30s of spawn -- ' +
+            'subprocess may be stuck during MCP server initialization or permission prompt. ' +
+            `stderr so far: ${stderrBuffer.trim() || '(empty)'}`,
+          );
+        }
+      }, 30_000);
 
       // Set up the timeout guard
       const timeout = setTimeout(() => {
@@ -69,6 +88,12 @@ class ClaudeBridge extends EventEmitter {
 
       // Collect and parse stdout stream-json chunks
       proc.stdout.on('data', (chunk) => {
+        if (!receivedFirstOutput) {
+          receivedFirstOutput = true;
+          clearTimeout(startupTimeout);
+          this.logger.debug('claude', `First output received after ${Date.now() - startTime}ms`);
+        }
+
         stdoutBuffer += chunk.toString();
 
         // Process complete lines (NDJSON: one JSON object per line)
@@ -94,13 +119,21 @@ class ClaudeBridge extends EventEmitter {
         }
       });
 
-      // Monitor stderr for errors
+      // Monitor stderr for errors (log in real time for diagnostics)
       proc.stderr.on('data', (chunk) => {
-        stderrBuffer += chunk.toString();
+        const text = chunk.toString();
+        stderrBuffer += text;
+        for (const line of text.split('\n')) {
+          const trimmed = line.trim();
+          if (trimmed) {
+            this.logger.debug('claude-stderr', trimmed);
+          }
+        }
       });
 
       proc.on('close', (code) => {
         clearTimeout(timeout);
+        clearTimeout(startupTimeout);
         this.activeProcess = null;
 
         // Process any remaining data in the stdout buffer
@@ -172,7 +205,7 @@ class ClaudeBridge extends EventEmitter {
    * @private
    */
   _buildArgs(sessionId, systemPrompt) {
-    const args = ['-p', '--output-format', 'stream-json', '--verbose'];
+    const args = ['-p', '--output-format', 'stream-json', '--verbose', '--permission-mode', 'bypassPermissions'];
 
     if (sessionId) {
       // Continuation: resume an existing session
@@ -187,6 +220,11 @@ class ClaudeBridge extends EventEmitter {
 
       args.push('--mcp-config', this.config.MCP_CONFIG_PATH);
       args.push('--allowed-tools', this.config.MCP_TOOLS_WHITELIST);
+
+      const settingsPath = path.join(
+        this.config.DATA_DIR, 'claude-runtime', '.claude', 'settings.json',
+      );
+      args.push('--settings', settingsPath);
 
       if (this.config.CLAUDE_MAX_BUDGET) {
         args.push('--max-budget-usd', this.config.CLAUDE_MAX_BUDGET);

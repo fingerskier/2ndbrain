@@ -19,7 +19,8 @@
       "mcp__dude__get_project_context",
       "mcp__dude__create_project",
       "mcp__dude__create_issue",
-      "mcp__dude__update_issue"
+      "mcp__dude__update_issue",
+      "Bash(npx --version)"
     ]
   }
 }
