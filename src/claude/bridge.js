@@ -1,5 +1,6 @@
 import { spawn } from 'node:child_process';
 import { EventEmitter } from 'node:events';
+import fs from 'node:fs';
 import path from 'node:path';
 
 /**
@@ -42,6 +43,11 @@ class ClaudeBridge extends EventEmitter {
     const startTime = Date.now();
     const args = this._buildArgs(sessionId, systemPrompt);
 
+    // Pre-spawn MCP config validation (new sessions only)
+    if (!sessionId) {
+      this._validateMcpConfig();
+    }
+
     this.logger.info('claude', `Spawning: claude ${args.join(' ')}`);
 
     const runtimeDir = path.join(this.config.DATA_DIR, 'claude-runtime');
@@ -54,6 +60,7 @@ class ClaudeBridge extends EventEmitter {
       });
 
       this.activeProcess = proc;
+      this.logger.info('claude', `Subprocess spawned (pid=${proc.pid}, cwd=${runtimeDir})`);
 
       let stdoutBuffer = '';
       let stderrBuffer = '';
@@ -63,17 +70,38 @@ class ClaudeBridge extends EventEmitter {
       let timedOut = false;
       let receivedFirstOutput = false;
 
-      // Startup watchdog: warn if no stdout arrives within 30s
-      const startupTimeout = setTimeout(() => {
-        if (!receivedFirstOutput) {
-          this.logger.warn(
+      // Progressive startup watchdog: warn at escalating intervals if no stdout arrives.
+      // Delays between checks: 10s, 10s, 10s, 15s, 15s → cumulative: 10, 20, 30, 45, 60s, then every 30s.
+      const WATCHDOG_DELAYS = [10_000, 10_000, 10_000, 15_000, 15_000];
+      let watchdogStep = 0;
+      let startupTimeout = null;
+
+      const scheduleWatchdog = () => {
+        const delay = watchdogStep < WATCHDOG_DELAYS.length
+          ? WATCHDOG_DELAYS[watchdogStep]
+          : 30_000;
+
+        startupTimeout = setTimeout(() => {
+          if (receivedFirstOutput) return;
+
+          const elapsed = Date.now() - startTime;
+          const level = elapsed >= 30_000 ? 'warn' : 'info';
+          const stderrTail = stderrBuffer.trim()
+            ? stderrBuffer.trim().slice(-500)
+            : '(empty)';
+
+          this.logger[level](
             'claude',
-            'No output received from Claude CLI within 30s of spawn -- ' +
-            'subprocess may be stuck during MCP server initialization or permission prompt. ' +
-            `stderr so far: ${stderrBuffer.trim() || '(empty)'}`,
+            `No stdout after ${Math.round(elapsed / 1000)}s (pid=${proc.pid}) -- ` +
+            'possible causes: MCP server init (npx download), API queueing, network issue. ' +
+            `stderr tail: ${stderrTail}`,
           );
-        }
-      }, 30_000);
+
+          watchdogStep++;
+          scheduleWatchdog();
+        }, delay);
+      };
+      scheduleWatchdog();
 
       // Set up the timeout guard
       const timeout = setTimeout(() => {
@@ -85,13 +113,14 @@ class ClaudeBridge extends EventEmitter {
       // Pipe the user message via stdin and close it
       proc.stdin.write(message);
       proc.stdin.end();
+      this.logger.info('claude', `Message piped to stdin and closed (${message.length} chars)`);
 
       // Collect and parse stdout stream-json chunks
       proc.stdout.on('data', (chunk) => {
         if (!receivedFirstOutput) {
           receivedFirstOutput = true;
           clearTimeout(startupTimeout);
-          this.logger.debug('claude', `First output received after ${Date.now() - startTime}ms`);
+          this.logger.info('claude', `First stdout received after ${Date.now() - startTime}ms (pid=${proc.pid})`);
         }
 
         stdoutBuffer += chunk.toString();
@@ -119,19 +148,27 @@ class ClaudeBridge extends EventEmitter {
         }
       });
 
-      // Monitor stderr for errors (log in real time for diagnostics)
+      // Monitor stderr for errors (log in real time for diagnostics).
+      // During startup (before first stdout), promote to INFO so MCP init
+      // messages (npx downloads, connection errors) are visible at default log level.
       proc.stderr.on('data', (chunk) => {
         const text = chunk.toString();
         stderrBuffer += text;
         for (const line of text.split('\n')) {
           const trimmed = line.trim();
           if (trimmed) {
-            this.logger.debug('claude-stderr', trimmed);
+            if (!receivedFirstOutput) {
+              this.logger.info('claude-stderr', trimmed);
+            } else {
+              this.logger.debug('claude-stderr', trimmed);
+            }
           }
         }
       });
 
       proc.on('close', (code) => {
+        const elapsed = Date.now() - startTime;
+        this.logger.info('claude', `Subprocess exited (pid=${proc.pid}, code=${code}, elapsed=${elapsed}ms)`);
         clearTimeout(timeout);
         clearTimeout(startupTimeout);
         this.activeProcess = null;
@@ -232,6 +269,37 @@ class ClaudeBridge extends EventEmitter {
     }
 
     return args;
+  }
+
+  /**
+   * Validate MCP config file before spawning. Logs diagnostics for common
+   * issues (missing file, npx-based servers that may download on first run).
+   * Does NOT block the spawn -- purely diagnostic.
+   * @private
+   */
+  _validateMcpConfig() {
+    const configPath = this.config.MCP_CONFIG_PATH;
+    if (!configPath) {
+      this.logger.info('claude', 'No MCP_CONFIG_PATH configured; skipping MCP config validation');
+      return;
+    }
+
+    try {
+      const raw = fs.readFileSync(configPath, 'utf-8');
+      const parsed = JSON.parse(raw);
+      const servers = parsed.mcpServers || {};
+      const serverNames = Object.keys(servers);
+
+      this.logger.info('claude', `MCP config: ${configPath} (${serverNames.length} server(s): ${serverNames.join(', ')})`);
+
+      for (const [name, server] of Object.entries(servers)) {
+        if (server.command === 'npx') {
+          this.logger.info('claude', `MCP server "${name}" uses npx -- first-run download may cause startup delay`);
+        }
+      }
+    } catch (err) {
+      this.logger.warn('claude', `MCP config validation failed (${configPath}): ${err.message}`);
+    }
   }
 
   /**

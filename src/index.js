@@ -409,7 +409,9 @@ async function main() {
       mcpConfigPath = generateMcpConfig(config);
       // Override MCP_CONFIG_PATH to use the generated one
       config.MCP_CONFIG_PATH = mcpConfigPath;
-      logger.info('startup', `MCP config written to ${mcpConfigPath}`);
+      const mcpContent = JSON.parse(fs.readFileSync(mcpConfigPath, 'utf-8'));
+      const mcpServerNames = Object.keys(mcpContent.mcpServers || {});
+      logger.info('startup', `MCP config written to ${mcpConfigPath} (servers: ${mcpServerNames.join(', ')})`);
     } catch (err) {
       logger.error('startup', `Failed to generate MCP config: ${err.message}`);
     }
