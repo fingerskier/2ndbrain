@@ -518,7 +518,7 @@ async function main() {
   }
 
   // Start background embedding worker
-  if (embeddingsEngine.isEnabled() && dbReady) {
+  if (embeddingsEngine.isInitialized() && dbReady) {
     embeddingWorker = new EmbeddingWorker({ db: { query }, config, logger });
     embeddingWorker.start();
   }

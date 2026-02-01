@@ -31,6 +31,7 @@ class EmbeddingsEngine {
     this.config = config;
     this.logger = logger;
     this._dimensions = null;
+    this._initialized = false;
   }
 
   /**
@@ -40,6 +41,16 @@ class EmbeddingsEngine {
    */
   isEnabled() {
     return Boolean(this.config.EMBEDDING_PROVIDER);
+  }
+
+  /**
+   * Returns true when the embedding engine has been successfully initialized
+   * (tables created / verified).
+   *
+   * @returns {boolean}
+   */
+  isInitialized() {
+    return this._initialized;
   }
 
   /**
@@ -87,6 +98,7 @@ class EmbeddingsEngine {
 
     if (!tableCheck.rows[0].table_exists) {
       await this._firstTimeSetup(provider, model, dimensions);
+      this._initialized = true;
       return;
     }
 
@@ -98,6 +110,7 @@ class EmbeddingsEngine {
     if (configRow.rows.length === 0) {
       // Table present but empty -- treat as first-time setup
       await this._firstTimeSetup(provider, model, dimensions);
+      this._initialized = true;
       return;
     }
 
@@ -110,11 +123,13 @@ class EmbeddingsEngine {
     ) {
       // Configuration unchanged
       this.logger.info('embeddings', 'Embedding configuration unchanged.');
+      this._initialized = true;
       return;
     }
 
     // Configuration differs -- perform model switch
     await this._handleModelSwitch(current, { provider, model, dimensions });
+    this._initialized = true;
   }
 
   /**

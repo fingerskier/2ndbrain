@@ -53,7 +53,9 @@ class EmbeddingWorker {
 
     /** Guard to prevent overlapping iterations. */
     this._processing = false;
-  }
+
+    /** Whether the embeddings table has been verified to exist. */
+    this._tableVerified = false;
 
   /**
    * Start the periodic embedding worker loop.
@@ -125,6 +127,25 @@ class EmbeddingWorker {
    * Fetch and process a batch of rows with NULL vectors.
    */
   async _processQueue() {
+    // On first call, verify the embeddings table exists
+    if (!this._tableVerified) {
+      const check = await this.db.query(
+        `SELECT EXISTS (
+           SELECT FROM information_schema.tables
+           WHERE table_schema = 'public' AND table_name = 'embeddings'
+         ) AS ok`,
+      );
+      if (!check.rows[0].ok) {
+        this.logger.warn(
+          'embedding-worker',
+          'Embeddings table does not exist; stopping worker.',
+        );
+        this.stop();
+        return;
+      }
+      this._tableVerified = true;
+    }
+
     const result = await this.db.query(
       `SELECT id, entity_type, entity_id
        FROM embeddings
