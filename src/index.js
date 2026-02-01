@@ -36,6 +36,7 @@ import { EmbeddingsEngine } from './embeddings/engine.js';
 import { EmbeddingWorker } from './embeddings/worker.js';
 import { SchedulerWorker } from './scheduler/worker.js';
 import { WebServer } from './web/server.js';
+import { runSelfTest } from './claude/self-test.js';
 
 // ---------------------------------------------------------------------------
 // State
@@ -440,7 +441,7 @@ async function main() {
   });
 
   // Step 6: Start web admin server
-  webServer = new WebServer({ config, db: { query }, logger });
+  webServer = new WebServer({ config, db: { query }, logger, claudeBridge });
   try {
     await webServer.start();
   } catch (err) {
@@ -566,6 +567,15 @@ async function main() {
   }
 
   logger.info('startup', 'Startup complete.');
+
+  // Run Claude self-test asynchronously (non-blocking)
+  if (claudeAvailable) {
+    runSelfTest({ config, logger }).then((results) => {
+      config._selfTestResults = results;
+    }).catch((err) => {
+      logger.warn('self-test', `Self-test failed: ${err.message}`);
+    });
+  }
 
   // Step 9: Auto-open browser
   const baseUrl = `http://${config.WEB_BIND}:${config.WEB_PORT}`;

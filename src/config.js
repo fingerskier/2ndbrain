@@ -37,6 +37,7 @@ const config = {
   CLAUDE_MODEL: env.CLAUDE_MODEL || 'claude-sonnet-4-20250514',
   CLAUDE_THINKING: env.CLAUDE_THINKING || 'true',
   CLAUDE_TIMEOUT: parseInt(env.CLAUDE_TIMEOUT, 10) || 120000,
+  MCP_INIT_TIMEOUT: parseInt(env.MCP_INIT_TIMEOUT, 10) || 30000,
   CLAUDE_MAX_BUDGET: env.CLAUDE_MAX_BUDGET || '',
 
   // Storage

@@ -1,6 +1,7 @@
 import { spawn } from 'node:child_process';
 import { EventEmitter } from 'node:events';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 
 /**
@@ -34,21 +35,54 @@ class ClaudeBridge extends EventEmitter {
    * For continuations, spawns with --resume to continue the existing session.
    * The user message is piped via stdin to handle special characters safely.
    *
+   * If MCP servers fail to initialize within MCP_INIT_TIMEOUT, automatically
+   * retries without MCP servers so the user still gets a response.
+   *
    * @param {string} message - The user message to send
    * @param {string|null} [sessionId=null] - Existing session ID for continuation
    * @param {string} [systemPrompt=''] - System prompt for new sessions
-   * @returns {Promise<{ text: string, sessionId: string, cost: number, duration: number, toolCalls: Array }>}
+   * @param {object} [options={}]
+   * @param {boolean} [options.skipMcp=false] - Skip MCP server configuration
+   * @param {number} [options.timeout] - Override CLAUDE_TIMEOUT for this invocation
+   * @returns {Promise<{ text: string, sessionId: string, cost: number, duration: number, toolCalls: Array, _mcpFallback?: boolean }>}
    */
-  async invoke(message, sessionId = null, systemPrompt = '') {
-    const startTime = Date.now();
-    const args = this._buildArgs(sessionId, systemPrompt);
+  async invoke(message, sessionId = null, systemPrompt = '', { skipMcp = false, timeout: overrideTimeout } = {}) {
+    try {
+      return await this._spawnAndWait(message, sessionId, systemPrompt, { skipMcp, timeout: overrideTimeout });
+    } catch (err) {
+      // If MCP initialization timed out, retry without MCP servers
+      if (err.mcpTimeout && !sessionId && !skipMcp) {
+        this.logger.warn('claude', 'Retrying invocation WITHOUT MCP servers as fallback');
+        const result = await this._spawnAndWait(message, sessionId, systemPrompt, { skipMcp: true, timeout: overrideTimeout });
+        result._mcpFallback = true;
+        return result;
+      }
+      throw err;
+    }
+  }
 
-    // Pre-spawn MCP config validation (new sessions only)
-    if (!sessionId) {
+  /**
+   * Spawn a claude subprocess and wait for its response.
+   * @private
+   */
+  _spawnAndWait(message, sessionId, systemPrompt, { skipMcp = false, timeout: overrideTimeout } = {}) {
+    const startTime = Date.now();
+    const args = this._buildArgs(sessionId, systemPrompt, { skipMcp });
+    const effectiveTimeout = overrideTimeout || this.config.CLAUDE_TIMEOUT;
+
+    // Pre-spawn MCP config validation (new sessions only, when MCP is enabled)
+    if (!sessionId && !skipMcp) {
       this._validateMcpConfig();
     }
 
-    this.logger.info('claude', `Spawning: claude ${args.join(' ')}`);
+    this.logger.info('claude', `Spawning: claude ${JSON.stringify(args)}`);
+    this.logger.info('claude', [
+      `Subprocess env: node=${process.version}`,
+      `platform=${process.platform}`,
+      `arch=${process.arch}`,
+      `freemem=${Math.round(os.freemem() / 1048576)}MB`,
+      skipMcp ? 'mcp=disabled' : 'mcp=enabled',
+    ].join(', '));
 
     const runtimeDir = path.join(this.config.DATA_DIR, 'claude-runtime');
 
@@ -68,7 +102,15 @@ class ClaudeBridge extends EventEmitter {
       const toolCalls = [];
       let resultData = null;
       let timedOut = false;
+      let mcpTimedOut = false;
       let receivedFirstOutput = false;
+
+      // --- MCP initialization timeout ---
+      // If no stdout arrives within MCP_INIT_TIMEOUT, MCP servers are likely
+      // hanging. Kill the process and let invoke() retry without MCP.
+      const mcpInitTimeout = (!sessionId && !skipMcp)
+        ? this.config.MCP_INIT_TIMEOUT
+        : 0;
 
       // Progressive startup watchdog: warn at escalating intervals if no stdout arrives.
       // Delays between checks: 10s, 10s, 10s, 15s, 15s → cumulative: 10, 20, 30, 45, 60s, then every 30s.
@@ -85,11 +127,26 @@ class ClaudeBridge extends EventEmitter {
           if (receivedFirstOutput) return;
 
           const elapsed = Date.now() - startTime;
-          const level = elapsed >= 30_000 ? 'warn' : 'info';
           const stderrTail = stderrBuffer.trim()
             ? stderrBuffer.trim().slice(-500)
             : '(empty)';
 
+          // Check if we've hit the MCP init timeout threshold
+          if (mcpInitTimeout && elapsed >= mcpInitTimeout && !mcpTimedOut) {
+            mcpTimedOut = true;
+            this.logger.warn(
+              'claude',
+              `MCP initialization timed out after ${Math.round(elapsed / 1000)}s (pid=${proc.pid}). ` +
+              `MCP servers likely hanging (npx download or connection issue). stderr tail: ${stderrTail}`,
+            );
+            // Kill the subprocess; the close handler will reject with mcpTimeout error
+            if (proc.exitCode === null) {
+              proc.kill('SIGTERM');
+            }
+            return;
+          }
+
+          const level = elapsed >= 30_000 ? 'warn' : 'info';
           this.logger[level](
             'claude',
             `No stdout after ${Math.round(elapsed / 1000)}s (pid=${proc.pid}) -- ` +
@@ -103,12 +160,12 @@ class ClaudeBridge extends EventEmitter {
       };
       scheduleWatchdog();
 
-      // Set up the timeout guard
-      const timeout = setTimeout(() => {
+      // Set up the overall timeout guard
+      const timeoutTimer = setTimeout(() => {
         timedOut = true;
-        this.logger.warn('claude', `Subprocess timed out after ${this.config.CLAUDE_TIMEOUT}ms`);
+        this.logger.warn('claude', `Subprocess timed out after ${effectiveTimeout}ms`);
         this.kill();
-      }, this.config.CLAUDE_TIMEOUT);
+      }, effectiveTimeout);
 
       // Pipe the user message via stdin and close it
       proc.stdin.write(message);
@@ -169,7 +226,7 @@ class ClaudeBridge extends EventEmitter {
       proc.on('close', (code) => {
         const elapsed = Date.now() - startTime;
         this.logger.info('claude', `Subprocess exited (pid=${proc.pid}, code=${code}, elapsed=${elapsed}ms)`);
-        clearTimeout(timeout);
+        clearTimeout(timeoutTimer);
         clearTimeout(startupTimeout);
         this.activeProcess = null;
 
@@ -188,8 +245,20 @@ class ClaudeBridge extends EventEmitter {
 
         const duration = Date.now() - startTime;
 
+        // MCP initialization timeout: reject with tagged error so invoke() can retry
+        if (mcpTimedOut) {
+          const err = new Error(
+            `MCP initialization timed out after ${mcpInitTimeout}ms -- ` +
+            'MCP servers failed to start. Consider pre-installing: ' +
+            'npm install -g @modelcontextprotocol/server-postgres',
+          );
+          err.mcpTimeout = true;
+          reject(err);
+          return;
+        }
+
         if (timedOut) {
-          reject(new Error(`Claude subprocess timed out after ${this.config.CLAUDE_TIMEOUT}ms`));
+          reject(new Error(`Claude subprocess timed out after ${effectiveTimeout}ms`));
           return;
         }
 
@@ -224,7 +293,8 @@ class ClaudeBridge extends EventEmitter {
       });
 
       proc.on('error', (err) => {
-        clearTimeout(timeout);
+        clearTimeout(timeoutTimer);
+        clearTimeout(startupTimeout);
         this.activeProcess = null;
         this.logger.error('claude', `Failed to spawn claude: ${err.message}`);
         this.emit('error', err);
@@ -238,10 +308,12 @@ class ClaudeBridge extends EventEmitter {
    *
    * @param {string|null} sessionId - Session ID for continuation, or null for new
    * @param {string} systemPrompt - System prompt for new sessions
+   * @param {object} [options={}]
+   * @param {boolean} [options.skipMcp=false] - Omit MCP config and allowed-tools args
    * @returns {string[]}
    * @private
    */
-  _buildArgs(sessionId, systemPrompt) {
+  _buildArgs(sessionId, systemPrompt, { skipMcp = false } = {}) {
     const args = ['-p', '--output-format', 'stream-json', '--verbose', '--permission-mode', 'bypassPermissions'];
 
     if (sessionId) {
@@ -255,8 +327,10 @@ class ClaudeBridge extends EventEmitter {
         args.push('--system-prompt', systemPrompt);
       }
 
-      args.push('--mcp-config', this.config.MCP_CONFIG_PATH);
-      args.push('--allowed-tools', this.config.MCP_TOOLS_WHITELIST);
+      if (!skipMcp && this.config.MCP_CONFIG_PATH) {
+        args.push('--mcp-config', this.config.MCP_CONFIG_PATH);
+        args.push('--allowed-tools', this.config.MCP_TOOLS_WHITELIST);
+      }
 
       const settingsPath = path.join(
         this.config.DATA_DIR, 'claude-runtime', '.claude', 'settings.json',

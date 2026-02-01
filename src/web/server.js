@@ -1,10 +1,13 @@
 import express from 'express';
+import { execSync } from 'node:child_process';
 import { createServer } from 'node:http';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { migrate, getMigrationFiles, ensureMigrationsTable } from '../db/migrate.js';
 import { ENV_PATH } from '../config.js';
+import { runSelfTest } from '../claude/self-test.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -99,11 +102,13 @@ class WebServer {
    * @param {object}  opts.config - Application configuration object
    * @param {object}  opts.db     - Database interface with query(text, params)
    * @param {object}  opts.logger - Logger instance with info/warn/error methods
+   * @param {object}  [opts.claudeBridge] - ClaudeBridge instance for diagnostics
    */
-  constructor({ config, db, logger }) {
+  constructor({ config, db, logger, claudeBridge = null }) {
     this._config = config;
     this._db = db;
     this._logger = logger;
+    this._claudeBridge = claudeBridge;
     this._server = null;
     this._app = null;
     this._envPath = ENV_PATH;
@@ -127,6 +132,7 @@ class WebServer {
     app.post('/settings', (req, res) => this._handleSaveSettings(req, res));
     app.get('/logs', (req, res) => this._handleLogs(req, res));
     app.get('/health', (req, res) => this._handleHealth(req, res));
+    app.get('/diagnose', (req, res) => this._handleDiagnose(req, res));
     app.get('/database', (req, res) => this._handleDatabase(req, res));
     app.post('/database/migrate', (req, res) => this._handleRunMigrations(req, res));
 
@@ -289,17 +295,24 @@ class WebServer {
   async _handleHealth(_req, res) {
     const health = {
       status: 'ok',
-      components: {
-        database: 'ok',
-        telegram: 'unknown',
-        claude: 'unknown',
-      },
+      components: {},
       uptime: process.uptime(),
       memory: process.memoryUsage(),
+      system: {
+        platform: process.platform,
+        arch: process.arch,
+        nodeVersion: process.version,
+        freeMem: Math.round(os.freemem() / 1048576),
+        totalMem: Math.round(os.totalmem() / 1048576),
+      },
+      selfTest: this._config._selfTestResults || null,
     };
 
+    // Database check
     try {
+      const start = Date.now();
       await this._db.query('SELECT 1');
+      health.components.database = { status: 'ok', responseMs: Date.now() - start };
     } catch (err) {
       health.components.database = {
         status: 'error',
@@ -308,15 +321,70 @@ class WebServer {
       };
     }
 
-    // Derive overall status from component states
-    const states = Object.values(health.components);
-    const isErr = (s) => s === 'error' || (typeof s === 'object' && s.status === 'error');
-    if (states.some(isErr)) {
-      health.status = states.every(isErr) ? 'error' : 'degraded';
+    // Claude CLI availability
+    try {
+      const start = Date.now();
+      const version = execSync('claude --version', {
+        timeout: 5000,
+        encoding: 'utf-8',
+      }).trim();
+      health.components.claude_cli = { status: 'ok', version, responseMs: Date.now() - start };
+    } catch (err) {
+      health.components.claude_cli = { status: 'error', error: err.message };
+    }
+
+    // MCP server status from self-test (if available)
+    const selfTest = this._config._selfTestResults;
+    if (selfTest) {
+      health.components.claude_api = {
+        status: selfTest.cliOk ? 'ok' : 'error',
+        responseMs: selfTest.cliResponseMs,
+      };
+      health.components.mcp_integration = {
+        status: selfTest.fullIntegrationOk ? 'ok' : (selfTest.cliOk ? 'degraded' : 'unknown'),
+        responseMs: selfTest.fullIntegrationMs,
+      };
+      if (selfTest.mcpServers && Object.keys(selfTest.mcpServers).length > 0) {
+        health.components.mcp_servers = {};
+        for (const [name, result] of Object.entries(selfTest.mcpServers)) {
+          health.components.mcp_servers[name] = {
+            status: result.ok ? 'ok' : 'error',
+            responseMs: result.responseMs,
+            error: result.error,
+          };
+        }
+      }
+    }
+
+    // Derive overall status
+    const statuses = [];
+    for (const val of Object.values(health.components)) {
+      if (val && typeof val === 'object' && val.status) {
+        statuses.push(val.status);
+      }
+    }
+    if (statuses.some((s) => s === 'error')) {
+      health.status = statuses.every((s) => s === 'error') ? 'error' : 'degraded';
     }
 
     const httpStatus = health.status === 'error' ? 503 : 200;
     res.status(httpStatus).json(health);
+  }
+
+  /**
+   * On-demand diagnostics endpoint. Runs the full self-test suite and returns
+   * detailed results. This endpoint may take 30-60 seconds to complete.
+   */
+  async _handleDiagnose(_req, res) {
+    this._logger.info('web', 'Running on-demand diagnostics via /diagnose...');
+    try {
+      const results = await runSelfTest({ config: this._config, logger: this._logger });
+      this._config._selfTestResults = results;
+      res.json(results);
+    } catch (err) {
+      this._logger.error('web', `Diagnostics failed: ${err.message}`);
+      res.status(500).json({ error: err.message });
+    }
   }
 
   // -----------------------------------------------------------------------
