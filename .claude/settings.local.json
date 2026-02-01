@@ -15,7 +15,11 @@
       "Bash(node:*)",
       "Bash(ls -la \"c:\\\\dev\\\\fingerskier\\\\agent\\\\2ndbrain\\\\src\\\\web\"\" 2>/dev/null || echo \"web directory not found \")",
       "Bash(ls -la \"c:\\\\dev\\\\fingerskier\\\\agent\\\\2ndbrain\\\\db\"\" 2>/dev/null || echo \"Directory not accessible \")",
-      "Bash(npm install:*)"
+      "Bash(npm install:*)",
+      "mcp__dude__get_project_context",
+      "mcp__dude__create_project",
+      "mcp__dude__create_issue",
+      "mcp__dude__update_issue"
     ]
   }
 }

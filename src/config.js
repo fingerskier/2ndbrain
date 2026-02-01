@@ -7,9 +7,22 @@ import { fileURLToPath } from 'node:url';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const PROJECT_ROOT = path.resolve(__dirname, '..');
-const ENV_PATH = path.join(PROJECT_ROOT, '.env');
+const SETTINGS_DIR = path.join(os.homedir(), '.2ndbrain');
+const ENV_PATH = path.join(SETTINGS_DIR, '.env');
+const LEGACY_ENV_PATH = path.join(PROJECT_ROOT, '.env');
 
-// Load .env from project root
+// Migrate legacy .env from package root to stable user directory
+if (!fs.existsSync(ENV_PATH) && fs.existsSync(LEGACY_ENV_PATH)) {
+  try {
+    fs.mkdirSync(SETTINGS_DIR, { recursive: true });
+    fs.copyFileSync(LEGACY_ENV_PATH, ENV_PATH);
+  } catch { /* fall through to first-run */ }
+}
+
+// Ensure settings directory exists
+try { fs.mkdirSync(SETTINGS_DIR, { recursive: true }); } catch { /* ignore */ }
+
+// Load .env from stable user directory
 dotenvConfig({ path: ENV_PATH });
 
 const env = process.env;
@@ -99,5 +112,5 @@ function isFirstRun() {
   return !valid;
 }
 
-export { config, validateConfig, isFirstRun, PROJECT_ROOT, ENV_PATH };
+export { config, validateConfig, isFirstRun, PROJECT_ROOT, ENV_PATH, SETTINGS_DIR };
 export default config;

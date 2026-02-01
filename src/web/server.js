@@ -4,11 +4,10 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { migrate, getMigrationFiles, ensureMigrationsTable } from '../db/migrate.js';
+import { ENV_PATH } from '../config.js';
 
-// Resolve project root (two directories up from src/web/)
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-const DEFAULT_ENV_PATH = path.resolve(__dirname, '..', '..', '.env');
 
 // ---------------------------------------------------------------------------
 // Settings field definitions -- drives both the form UI and save logic
@@ -107,7 +106,7 @@ class WebServer {
     this._logger = logger;
     this._server = null;
     this._app = null;
-    this._envPath = config.ENV_PATH || DEFAULT_ENV_PATH;
+    this._envPath = ENV_PATH;
   }
 
   /**
