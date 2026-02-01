@@ -56,6 +56,7 @@ class EmbeddingWorker {
 
     /** Whether the embeddings table has been verified to exist. */
     this._tableVerified = false;
+  }
 
   /**
    * Start the periodic embedding worker loop.
