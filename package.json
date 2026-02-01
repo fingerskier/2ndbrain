@@ -1,6 +1,6 @@
 {
   "name": "2ndbrain",
-  "version": "2026.1.37",
+  "version": "2026.1.38",
   "description": "Always-on Node.js service bridging Telegram messaging to Claude AI with knowledge graph, journal, project management, and semantic search.",
   "main": "src/index.js",
   "bin": {
