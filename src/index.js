@@ -96,19 +96,42 @@ function setupRuntimeFiles() {
 }
 
 // ---------------------------------------------------------------------------
-// Helper: verify claude-cli is installed
+// Helper: find claude-cli and resolve its full path
 // ---------------------------------------------------------------------------
 
-function verifyClaude() {
+function findClaude() {
+  const isWindows = process.platform === 'win32';
+  const command = isWindows ? 'claude.cmd' : 'claude';
+
   try {
-    const version = execSync('claude --version', {
+    // Try to get full path using which/where
+    const whichCommand = isWindows ? 'where' : 'which';
+    let fullPath = null;
+
+    try {
+      const result = execSync(`${whichCommand} ${command}`, {
+        timeout: 5_000,
+        encoding: 'utf-8',
+      }).trim();
+      // 'where' on Windows returns multiple lines; take first
+      fullPath = result.split('\n')[0].trim();
+    } catch {
+      // which/where failed, fall back to PATH resolution
+      fullPath = command;
+    }
+
+    // Verify it works by running --version
+    const cmdToRun = fullPath.includes(' ') ? `"${fullPath}"` : fullPath;
+    const version = execSync(`${cmdToRun} --version`, {
       timeout: 10_000,
       encoding: 'utf-8',
     }).trim();
-    logger.info('startup', `claude-cli found: ${version}`);
-    return true;
-  } catch {
-    return false;
+
+    logger.info('startup', `claude-cli found at ${fullPath}: ${version}`);
+    return fullPath;
+  } catch (err) {
+    logger.warn('startup', `Could not locate claude command: ${err.message}`);
+    return null;
   }
 }
 
@@ -378,9 +401,9 @@ async function main() {
     }
   }
 
-  // Step 5: Verify claude-cli
-  const claudeAvailable = verifyClaude();
-  if (!claudeAvailable) {
+  // Step 5: Find claude-cli and resolve its path
+  const claudePath = findClaude();
+  if (!claudePath) {
     logger.error(
       'startup',
       'claude not found. Install Claude Code: https://claude.ai/code',
@@ -392,6 +415,9 @@ async function main() {
         process.exit(1);
       }
     }
+  } else {
+    // Store the resolved path in config for use by bridge and self-test
+    config.CLAUDE_COMMAND = claudePath;
   }
 
   // Set up runtime files (skills, hooks)

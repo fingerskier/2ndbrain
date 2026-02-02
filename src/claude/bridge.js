@@ -75,7 +75,9 @@ class ClaudeBridge extends EventEmitter {
       this._validateMcpConfig();
     }
 
-    const claudeCommand = process.platform === 'win32' ? 'claude.cmd' : 'claude';
+    // Use resolved path from config if available, otherwise fall back to platform-specific command
+    const claudeCommand = this.config.CLAUDE_COMMAND ||
+      (process.platform === 'win32' ? 'claude.cmd' : 'claude');
     this.logger.info('claude', `Spawning: ${claudeCommand} ${JSON.stringify(args)}`);
     this.logger.info('claude', [
       `Subprocess env: node=${process.version}`,

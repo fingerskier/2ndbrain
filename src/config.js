@@ -39,6 +39,7 @@ const config = {
   CLAUDE_TIMEOUT: parseInt(env.CLAUDE_TIMEOUT, 10) || 120000,
   MCP_INIT_TIMEOUT: parseInt(env.MCP_INIT_TIMEOUT, 10) || 30000,
   CLAUDE_MAX_BUDGET: env.CLAUDE_MAX_BUDGET || '',
+  CLAUDE_COMMAND: null, // Set at runtime after path resolution
 
   // Storage
   DATA_DIR: env.DATA_DIR || path.join(os.homedir(), 'data'),

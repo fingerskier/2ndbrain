@@ -43,6 +43,7 @@ async function runSelfTest({ config, logger }) {
   try {
     const start = Date.now();
     await spawnTest({
+      command: config.CLAUDE_COMMAND || 'claude',
       args: ['-p', '--output-format', 'stream-json', '--verbose', '--model', config.CLAUDE_MODEL],
       message: 'respond with just the word ok',
       cwd: runtimeDir,
@@ -119,6 +120,7 @@ async function runSelfTest({ config, logger }) {
         '--permission-mode', 'bypassPermissions',
       ];
       await spawnTest({
+        command: config.CLAUDE_COMMAND || 'claude',
         args,
         message: 'respond with just the word ok',
         cwd: runtimeDir,
