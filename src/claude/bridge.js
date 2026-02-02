@@ -75,7 +75,8 @@ class ClaudeBridge extends EventEmitter {
       this._validateMcpConfig();
     }
 
-    this.logger.info('claude', `Spawning: claude ${JSON.stringify(args)}`);
+    const claudeCommand = process.platform === 'win32' ? 'claude.cmd' : 'claude';
+    this.logger.info('claude', `Spawning: ${claudeCommand} ${JSON.stringify(args)}`);
     this.logger.info('claude', [
       `Subprocess env: node=${process.version}`,
       `platform=${process.platform}`,
@@ -87,11 +88,16 @@ class ClaudeBridge extends EventEmitter {
     const runtimeDir = path.join(this.config.DATA_DIR, 'claude-runtime');
 
     return new Promise((resolve, reject) => {
-      const proc = spawn('claude', args, {
+      const spawnOptions = {
         stdio: ['pipe', 'pipe', 'pipe'],
         cwd: runtimeDir,
         env: { ...process.env },
-      });
+      };
+      // On Windows, .cmd files require shell:true
+      if (process.platform === 'win32') {
+        spawnOptions.shell = true;
+      }
+      const proc = spawn(claudeCommand, args, spawnOptions);
 
       this.activeProcess = proc;
       this.logger.info('claude', `Subprocess spawned (pid=${proc.pid}, cwd=${runtimeDir})`);

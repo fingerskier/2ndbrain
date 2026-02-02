@@ -43,7 +43,7 @@ async function runSelfTest({ config, logger }) {
   try {
     const start = Date.now();
     await spawnTest({
-      args: ['-p', '--output-format', 'stream-json', '--model', config.CLAUDE_MODEL],
+      args: ['-p', '--output-format', 'stream-json', '--verbose', '--model', config.CLAUDE_MODEL],
       message: 'respond with just the word ok',
       cwd: runtimeDir,
       timeout: 30_000,
@@ -160,11 +160,18 @@ async function runSelfTest({ config, logger }) {
  */
 function spawnTest({ command = 'claude', args, message, cwd, timeout, expectOutput = true }) {
   return new Promise((resolve, reject) => {
-    const proc = spawn(command, args, {
+    // On Windows, use claude.cmd for proper execution
+    const effectiveCommand = (command === 'claude' && process.platform === 'win32') ? 'claude.cmd' : command;
+    const spawnOptions = {
       stdio: ['pipe', 'pipe', 'pipe'],
       cwd,
       env: { ...process.env },
-    });
+    };
+    // On Windows, .cmd files require shell:true
+    if (process.platform === 'win32') {
+      spawnOptions.shell = true;
+    }
+    const proc = spawn(effectiveCommand, args, spawnOptions);
 
     let stdout = '';
     let stderr = '';
