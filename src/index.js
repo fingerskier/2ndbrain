@@ -8,14 +8,13 @@
  *   2. Validate required config
  *   3. Connect to PostgreSQL, run pending migrations
  *   4. Resolve embedding configuration (if EMBEDDING_PROVIDER is set)
- *   5. Verify claude-cli is available
+ *   5. Initialize Claude SDK bridge
  *   6. Start web admin server
  *   7. Start Telegram long-polling
  *   8. Log startup, set signal handlers
  *   9. Auto-open browser
  */
 
-import { execSync } from 'node:child_process';
 import path from 'node:path';
 import fs from 'node:fs';
 
@@ -29,7 +28,7 @@ import { TelegramBot } from './telegram/bot.js';
 import { CommandRouter } from './telegram/commands.js';
 import { ClaudeBridge } from './claude/bridge.js';
 import { ConversationManager } from './claude/conversation.js';
-import { generateMcpConfig } from './mcp/config.js';
+import { createValidateCommandHook } from './claude/validate-command.js';
 import { createEmbedTool } from './mcp/embed-server.js';
 import { AttachmentStore } from './attachments/store.js';
 import { EmbeddingsEngine } from './embeddings/engine.js';
@@ -52,18 +51,16 @@ let embedTool = null;
 let shuttingDown = false;
 
 // ---------------------------------------------------------------------------
-// Helper: copy skill + hook files to the runtime directory
+// Helper: copy skill files to the runtime directory
 // ---------------------------------------------------------------------------
 
 function setupRuntimeFiles() {
   const runtimeDir = path.join(config.DATA_DIR, 'claude-runtime');
   const skillsDestDir = path.join(runtimeDir, '.claude', 'skills');
-  const hooksDestDir = path.join(runtimeDir, 'hooks');
 
   fs.mkdirSync(skillsDestDir, { recursive: true });
-  fs.mkdirSync(hooksDestDir, { recursive: true });
 
-  // Copy skill files
+  // Copy skill files (loaded by the SDK via settingSources: ['project'])
   const skillsSrcDir = path.join(PROJECT_ROOT, 'skills');
   if (fs.existsSync(skillsSrcDir)) {
     for (const skillDir of fs.readdirSync(skillsSrcDir)) {
@@ -79,60 +76,6 @@ function setupRuntimeFiles() {
         }
       }
     }
-  }
-
-  // Copy hook scripts
-  const hooksSrcDir = path.join(PROJECT_ROOT, 'hooks');
-  if (fs.existsSync(hooksSrcDir)) {
-    for (const file of fs.readdirSync(hooksSrcDir)) {
-      const src = path.join(hooksSrcDir, file);
-      const dest = path.join(hooksDestDir, file);
-      fs.copyFileSync(src, dest);
-      // Make scripts executable
-      if (file.endsWith('.sh')) {
-        fs.chmodSync(dest, 0o755);
-      }
-    }
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Helper: find claude-cli and resolve its full path
-// ---------------------------------------------------------------------------
-
-function findClaude() {
-  const isWindows = process.platform === 'win32';
-  const command = isWindows ? 'claude.cmd' : 'claude';
-
-  try {
-    // Try to get full path using which/where
-    const whichCommand = isWindows ? 'where' : 'which';
-    let fullPath = null;
-
-    try {
-      const result = execSync(`${whichCommand} ${command}`, {
-        timeout: 5_000,
-        encoding: 'utf-8',
-      }).trim();
-      // 'where' on Windows returns multiple lines; take first
-      fullPath = result.split('\n')[0].trim();
-    } catch {
-      // which/where failed, fall back to PATH resolution
-      fullPath = command;
-    }
-
-    // Verify it works by running --version
-    const cmdToRun = fullPath.includes(' ') ? `"${fullPath}"` : fullPath;
-    const version = execSync(`${cmdToRun} --version`, {
-      timeout: 10_000,
-      encoding: 'utf-8',
-    }).trim();
-
-    logger.info('startup', `claude-cli found at ${fullPath}: ${version}`);
-    return fullPath;
-  } catch (err) {
-    logger.warn('startup', `Could not locate claude command: ${err.message}`);
-    return null;
   }
 }
 
@@ -452,48 +395,16 @@ async function main() {
     }
   }
 
-  // Step 5: Find claude-cli and resolve its path
-  const claudePath = findClaude();
-  if (!claudePath) {
-    logger.error(
-      'startup',
-      'claude not found. Install Claude Code: https://claude.ai/code',
-    );
-    if (valid) {
-      // Only fail startup if config is present (not first run)
-      // On first run, we still want to show the settings page
-      if (!firstRun) {
-        process.exit(1);
-      }
-    }
-  } else {
-    // Store the resolved path in config for use by bridge and self-test
-    config.CLAUDE_COMMAND = claudePath;
-  }
-
-  // Set up runtime files (skills, hooks)
+  // Step 5: Set up runtime files (skills) for the SDK
   try {
     fs.mkdirSync(config.DATA_DIR, { recursive: true });
     setupRuntimeFiles();
-    logger.info('startup', 'Runtime files deployed.');
+    logger.info('startup', 'Runtime skill files deployed.');
   } catch (err) {
     logger.error('startup', `Failed to set up runtime files: ${err.message}`);
   }
 
-  // Generate MCP configuration
-  let mcpConfigPath;
-  if (config.DATABASE_URL) {
-    try {
-      mcpConfigPath = generateMcpConfig(config);
-      // Override MCP_CONFIG_PATH to use the generated one
-      config.MCP_CONFIG_PATH = mcpConfigPath;
-      const mcpContent = JSON.parse(fs.readFileSync(mcpConfigPath, 'utf-8'));
-      const mcpServerNames = Object.keys(mcpContent.mcpServers || {});
-      logger.info('startup', `MCP config written to ${mcpConfigPath} (servers: ${mcpServerNames.join(', ')})`);
-    } catch (err) {
-      logger.error('startup', `Failed to generate MCP config: ${err.message}`);
-    }
-  }
+  logger.info('startup', 'Using Claude SDK (@anthropic-ai/claude-code) for AI interactions.');
 
   // Create rate limiters
   const rateLimiters = createRateLimiters();
@@ -505,7 +416,20 @@ async function main() {
     config,
   });
 
-  const claudeBridge = new ClaudeBridge({ config, logger, hooks });
+  // Create the SDK PreToolUse hook for Bash command validation
+  const validateCommandHook = createValidateCommandHook({
+    config,
+    logger,
+    db: dbReady ? { query } : null,
+  });
+
+  const claudeBridge = new ClaudeBridge({
+    config,
+    logger,
+    hooks,
+    validateCommandHook,
+    db: dbReady ? { query } : null,
+  });
 
   // Create action tracker for structured action logging
   const actionTracker = dbReady ? new ActionTracker({ db: { query }, logger }) : null;
@@ -558,7 +482,7 @@ async function main() {
             components: {
               database: { ok: dbReady },
               telegram: { ok: true },
-              claude: { ok: claudeAvailable },
+              claude: { ok: true }, // SDK is always available (it's an npm dependency)
             },
           };
           // Check DB live status
@@ -652,13 +576,11 @@ async function main() {
   logger.info('startup', 'Startup complete.');
 
   // Run Claude self-test asynchronously (non-blocking)
-  if (claudeAvailable) {
-    runSelfTest({ config, logger }).then((results) => {
-      config._selfTestResults = results;
-    }).catch((err) => {
-      logger.warn('self-test', `Self-test failed: ${err.message}`);
-    });
-  }
+  runSelfTest({ config, logger }).then((results) => {
+    config._selfTestResults = results;
+  }).catch((err) => {
+    logger.warn('self-test', `Self-test failed: ${err.message}`);
+  });
 
   // Step 9: Auto-open browser
   const baseUrl = `http://${config.WEB_BIND}:${config.WEB_PORT}`;

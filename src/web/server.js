@@ -1,5 +1,4 @@
 import express from 'express';
-import { execSync } from 'node:child_process';
 import { createServer } from 'node:http';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -338,17 +337,8 @@ class WebServer {
       };
     }
 
-    // Claude CLI availability
-    try {
-      const start = Date.now();
-      const version = execSync('claude --version', {
-        timeout: 5000,
-        encoding: 'utf-8',
-      }).trim();
-      health.components.claude_cli = { status: 'ok', version, responseMs: Date.now() - start };
-    } catch (err) {
-      health.components.claude_cli = { status: 'error', error: err.message };
-    }
+    // Claude SDK availability (always present as an npm dependency)
+    health.components.claude_sdk = { status: 'ok' };
 
     // MCP server status from self-test (if available)
     const selfTest = this._config._selfTestResults;

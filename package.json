@@ -29,6 +29,7 @@
   },
   "homepage": "https://github.com/fingerskier/2ndbrain#readme",
   "dependencies": {
+    "@anthropic-ai/claude-code": "^2.1.34",
     "dotenv": "^16.4.7",
     "express": "^4.21.2",
     "node-cron": "^4.2.1",

@@ -1,41 +1,111 @@
-import { spawn } from 'node:child_process';
+import { query } from '@anthropic-ai/claude-code';
 import { EventEmitter } from 'node:events';
-import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 
 /**
- * Claude CLI subprocess bridge (spec section 5).
+ * Claude SDK bridge (spec section 5).
  *
- * Spawns `claude -p` as a child process for each conversational message.
- * Emits 'typing' events during streaming (for refreshing Telegram typing
+ * Uses the @anthropic-ai/claude-code SDK instead of spawning a CLI subprocess.
+ * Emits 'typing' events during streaming (for refreshing the Telegram typing
  * indicator) and 'error' events on failures.
+ *
+ * The public interface is unchanged from the subprocess version:
+ *   - invoke(message, sessionId, systemPrompt, options) -> { text, sessionId, cost, duration, toolCalls }
+ *   - isActive() -> boolean
+ *   - kill() -> void
  */
 class ClaudeBridge extends EventEmitter {
   /**
    * @param {object} options
    * @param {object} options.config - Application configuration object
    * @param {object} options.logger - Structured logger instance
-   * @param {object} [options.hooks] - Optional lifecycle hooks
+   * @param {object} [options.hooks] - Optional lifecycle hooks (app-level, not SDK hooks)
+   * @param {Function} [options.validateCommandHook] - SDK PreToolUse hook for Bash command validation
+   * @param {object} [options.db] - Optional database interface for hook logging
    */
-  constructor({ config, logger, hooks = {} }) {
+  constructor({ config, logger, hooks = {}, validateCommandHook = null, db = null }) {
     super();
     this.config = config;
     this.logger = logger;
     this.hooks = hooks;
+    this.validateCommandHook = validateCommandHook;
+    this.db = db;
 
-    /** @type {import('node:child_process').ChildProcess | null} */
-    this.activeProcess = null;
+    /** @type {AbortController|null} Active query abort controller */
+    this._abortController = null;
+
+    /** Whether a query is currently in progress */
+    this._active = false;
   }
 
   /**
-   * Invoke the Claude CLI with a user message.
+   * Build the MCP servers configuration object from application config.
+   * @returns {object} mcpServers config for the SDK
+   * @private
+   */
+  _buildMcpServers() {
+    const mcpServers = {};
+
+    if (this.config.DATABASE_URL) {
+      mcpServers.pg = {
+        command: 'npx',
+        args: ['-y', '@modelcontextprotocol/server-postgres', this.config.DATABASE_URL],
+      };
+    }
+
+    if (this.config.EMBEDDING_PROVIDER && this.config._embedServerUrl) {
+      mcpServers.embed = {
+        type: 'url',
+        url: this.config._embedServerUrl,
+      };
+    }
+
+    return mcpServers;
+  }
+
+  /**
+   * Build the SDK hooks configuration.
+   * @returns {object} hooks config for the SDK
+   * @private
+   */
+  _buildHooks() {
+    if (!this.validateCommandHook) return {};
+
+    return {
+      PreToolUse: [
+        {
+          matcher: 'Bash',
+          hooks: [this.validateCommandHook],
+        },
+      ],
+    };
+  }
+
+  /**
+   * Build allowed tools list from config.
+   * @param {boolean} skipMcp - Whether to exclude MCP tools
+   * @returns {string[]|undefined} Allowed tools list, or undefined to allow all
+   * @private
+   */
+  _buildAllowedTools(skipMcp) {
+    const whitelist = this.config.MCP_TOOLS_WHITELIST;
+    if (!whitelist || whitelist === '*') return undefined; // allow all
+
+    const tools = whitelist.split(',').map((t) => t.trim()).filter(Boolean);
+    if (skipMcp) {
+      // Remove MCP tool entries (mcp__*) when skipping MCP
+      return tools.filter((t) => !t.startsWith('mcp__'));
+    }
+    return tools;
+  }
+
+  /**
+   * Invoke Claude with a user message using the SDK.
    *
-   * For new sessions (no sessionId), spawns with full configuration flags.
-   * For continuations, spawns with --resume to continue the existing session.
-   * The user message is piped via stdin to handle special characters safely.
+   * For new sessions (no sessionId), starts with full configuration.
+   * For continuations, resumes the existing session.
    *
-   * If MCP servers fail to initialize within MCP_INIT_TIMEOUT, automatically
+   * If MCP servers fail to respond within MCP_INIT_TIMEOUT, automatically
    * retries without MCP servers so the user still gets a response.
    *
    * @param {string} message - The user message to send
@@ -48,12 +118,12 @@ class ClaudeBridge extends EventEmitter {
    */
   async invoke(message, sessionId = null, systemPrompt = '', { skipMcp = false, timeout: overrideTimeout } = {}) {
     try {
-      return await this._spawnAndWait(message, sessionId, systemPrompt, { skipMcp, timeout: overrideTimeout });
+      return await this._runQuery(message, sessionId, systemPrompt, { skipMcp, timeout: overrideTimeout });
     } catch (err) {
-      // If MCP initialization timed out, retry without MCP servers
+      // If MCP initialization caused the failure, retry without MCP
       if (err.mcpTimeout && !sessionId && !skipMcp) {
         this.logger.warn('claude', 'Retrying invocation WITHOUT MCP servers as fallback');
-        const result = await this._spawnAndWait(message, sessionId, systemPrompt, { skipMcp: true, timeout: overrideTimeout });
+        const result = await this._runQuery(message, sessionId, systemPrompt, { skipMcp: true, timeout: overrideTimeout });
         result._mcpFallback = true;
         return result;
       }
@@ -62,415 +132,218 @@ class ClaudeBridge extends EventEmitter {
   }
 
   /**
-   * Spawn a claude subprocess and wait for its response.
+   * Run a single SDK query and collect the result.
    * @private
    */
-  _spawnAndWait(message, sessionId, systemPrompt, { skipMcp = false, timeout: overrideTimeout } = {}) {
+  async _runQuery(message, sessionId, systemPrompt, { skipMcp = false, timeout: overrideTimeout } = {}) {
     const startTime = Date.now();
-    const args = this._buildArgs(sessionId, systemPrompt, { skipMcp });
     const effectiveTimeout = overrideTimeout || this.config.CLAUDE_TIMEOUT;
-
-    // Pre-spawn MCP config validation (new sessions only, when MCP is enabled)
-    if (!sessionId && !skipMcp) {
-      this._validateMcpConfig();
-    }
-
-    // Use resolved path from config if available, otherwise fall back to platform-specific command
-    const claudeCommand = this.config.CLAUDE_COMMAND ||
-      (process.platform === 'win32' ? 'claude.cmd' : 'claude');
-    this.logger.info('claude', `Spawning: ${claudeCommand} ${JSON.stringify(args)}`);
-    this.logger.info('claude', [
-      `Subprocess env: node=${process.version}`,
-      `platform=${process.platform}`,
-      `arch=${process.arch}`,
-      `freemem=${Math.round(os.freemem() / 1048576)}MB`,
-      skipMcp ? 'mcp=disabled' : 'mcp=enabled',
-    ].join(', '));
-
     const runtimeDir = path.join(this.config.DATA_DIR, 'claude-runtime');
 
-    return new Promise((resolve, reject) => {
-      const spawnOptions = {
-        stdio: ['pipe', 'pipe', 'pipe'],
-        cwd: runtimeDir,
-        env: { ...process.env },
-      };
-      // On Windows, .cmd files require shell:true
-      if (process.platform === 'win32') {
-        spawnOptions.shell = true;
-      }
-      const proc = spawn(claudeCommand, args, spawnOptions);
+    this._abortController = new AbortController();
+    this._active = true;
 
-      this.activeProcess = proc;
-      this.logger.info('claude', `Subprocess spawned (pid=${proc.pid}, cwd=${runtimeDir})`);
+    // Set up a timeout that aborts the query
+    const timeoutTimer = setTimeout(() => {
+      this.logger.warn('claude', `SDK query timed out after ${effectiveTimeout}ms`);
+      this._abortController?.abort();
+    }, effectiveTimeout);
 
-      let stdoutBuffer = '';
-      let stderrBuffer = '';
-      const textChunks = [];
-      const toolCalls = [];
-      let resultData = null;
-      let timedOut = false;
-      let mcpTimedOut = false;
-      let receivedFirstOutput = false;
+    // MCP init timeout: if no messages arrive within MCP_INIT_TIMEOUT, abort and retry without MCP
+    const mcpInitTimeout = (!sessionId && !skipMcp) ? this.config.MCP_INIT_TIMEOUT : 0;
+    let receivedFirstMessage = false;
+    let mcpTimedOut = false;
+    let mcpInitTimer = null;
 
-      // --- MCP initialization timeout ---
-      // If no stdout arrives within MCP_INIT_TIMEOUT, MCP servers are likely
-      // hanging. Kill the process and let invoke() retry without MCP.
-      const mcpInitTimeout = (!sessionId && !skipMcp)
-        ? this.config.MCP_INIT_TIMEOUT
-        : 0;
-
-      // Progressive startup watchdog: warn at escalating intervals if no stdout arrives.
-      // Delays between checks: 10s, 10s, 10s, 15s, 15s → cumulative: 10, 20, 30, 45, 60s, then every 30s.
-      const WATCHDOG_DELAYS = [10_000, 10_000, 10_000, 15_000, 15_000];
-      let watchdogStep = 0;
-      let startupTimeout = null;
-
-      const scheduleWatchdog = () => {
-        const delay = watchdogStep < WATCHDOG_DELAYS.length
-          ? WATCHDOG_DELAYS[watchdogStep]
-          : 30_000;
-
-        startupTimeout = setTimeout(() => {
-          if (receivedFirstOutput) return;
-
-          const elapsed = Date.now() - startTime;
-          const stderrTail = stderrBuffer.trim()
-            ? stderrBuffer.trim().slice(-500)
-            : '(empty)';
-
-          // Check if we've hit the MCP init timeout threshold
-          if (mcpInitTimeout && elapsed >= mcpInitTimeout && !mcpTimedOut) {
-            mcpTimedOut = true;
-            this.logger.warn(
-              'claude',
-              `MCP initialization timed out after ${Math.round(elapsed / 1000)}s (pid=${proc.pid}). ` +
-              `MCP servers likely hanging (npx download or connection issue). stderr tail: ${stderrTail}`,
-            );
-            // Kill the subprocess; the close handler will reject with mcpTimeout error
-            if (proc.exitCode === null) {
-              proc.kill('SIGTERM');
-            }
-            return;
-          }
-
-          const level = elapsed >= 30_000 ? 'warn' : 'info';
-          this.logger[level](
-            'claude',
-            `No stdout after ${Math.round(elapsed / 1000)}s (pid=${proc.pid}) -- ` +
-            'possible causes: MCP server init (npx download), API queueing, network issue. ' +
-            `stderr tail: ${stderrTail}`,
-          );
-
-          watchdogStep++;
-          scheduleWatchdog();
-        }, delay);
-      };
-      scheduleWatchdog();
-
-      // Set up the overall timeout guard
-      const timeoutTimer = setTimeout(() => {
-        timedOut = true;
-        this.logger.warn('claude', `Subprocess timed out after ${effectiveTimeout}ms`);
-        this.kill();
-      }, effectiveTimeout);
-
-      // Pipe the user message via stdin and close it
-      proc.stdin.write(message);
-      proc.stdin.end();
-      this.logger.info('claude', `Message piped to stdin and closed (${message.length} chars)`);
-
-      // Collect and parse stdout stream-json chunks
-      proc.stdout.on('data', (chunk) => {
-        if (!receivedFirstOutput) {
-          receivedFirstOutput = true;
-          clearTimeout(startupTimeout);
-          this.logger.info('claude', `First stdout received after ${Date.now() - startTime}ms (pid=${proc.pid})`);
+    if (mcpInitTimeout > 0) {
+      mcpInitTimer = setTimeout(() => {
+        if (!receivedFirstMessage) {
+          mcpTimedOut = true;
+          this.logger.warn('claude', `MCP initialization timed out after ${mcpInitTimeout}ms`);
+          this._abortController?.abort();
         }
-
-        stdoutBuffer += chunk.toString();
-
-        // Process complete lines (NDJSON: one JSON object per line)
-        const lines = stdoutBuffer.split('\n');
-        // Keep the last potentially incomplete line in the buffer
-        stdoutBuffer = lines.pop() || '';
-
-        for (const line of lines) {
-          const trimmed = line.trim();
-          if (!trimmed) continue;
-
-          try {
-            const parsed = JSON.parse(trimmed);
-            this._handleStreamChunk(parsed, textChunks, toolCalls);
-
-            if (parsed.type === 'result') {
-              resultData = parsed;
-            }
-          } catch {
-            // Non-JSON line; ignore
-            this.logger.debug('claude', `Non-JSON stdout line: ${trimmed}`);
-          }
-        }
-      });
-
-      // Monitor stderr for errors (log in real time for diagnostics).
-      // During startup (before first stdout), promote to INFO so MCP init
-      // messages (npx downloads, connection errors) are visible at default log level.
-      proc.stderr.on('data', (chunk) => {
-        const text = chunk.toString();
-        stderrBuffer += text;
-        for (const line of text.split('\n')) {
-          const trimmed = line.trim();
-          if (trimmed) {
-            if (!receivedFirstOutput) {
-              this.logger.info('claude-stderr', trimmed);
-            } else {
-              this.logger.debug('claude-stderr', trimmed);
-            }
-          }
-        }
-      });
-
-      proc.on('close', (code) => {
-        const elapsed = Date.now() - startTime;
-        this.logger.info('claude', `Subprocess exited (pid=${proc.pid}, code=${code}, elapsed=${elapsed}ms)`);
-        clearTimeout(timeoutTimer);
-        clearTimeout(startupTimeout);
-        this.activeProcess = null;
-
-        // Process any remaining data in the stdout buffer
-        if (stdoutBuffer.trim()) {
-          try {
-            const parsed = JSON.parse(stdoutBuffer.trim());
-            this._handleStreamChunk(parsed, textChunks, toolCalls);
-            if (parsed.type === 'result') {
-              resultData = parsed;
-            }
-          } catch {
-            // Ignore trailing non-JSON data
-          }
-        }
-
-        const duration = Date.now() - startTime;
-
-        // MCP initialization timeout: reject with tagged error so invoke() can retry
-        if (mcpTimedOut) {
-          const err = new Error(
-            `MCP initialization timed out after ${mcpInitTimeout}ms -- ` +
-            'MCP servers failed to start. Consider pre-installing: ' +
-            'npm install -g @modelcontextprotocol/server-postgres',
-          );
-          err.mcpTimeout = true;
-          reject(err);
-          return;
-        }
-
-        if (timedOut) {
-          reject(new Error(`Claude subprocess timed out after ${effectiveTimeout}ms`));
-          return;
-        }
-
-        if (code !== 0 && !resultData) {
-          const errMsg = stderrBuffer.trim() || `Claude process exited with code ${code}`;
-          this.logger.error('claude', errMsg);
-          this.emit('error', new Error(errMsg));
-          reject(new Error(errMsg));
-          return;
-        }
-
-        if (stderrBuffer.trim()) {
-          this.logger.debug('claude', `stderr: ${stderrBuffer.trim()}`);
-        }
-
-        const text = textChunks.join('');
-        const resolvedSessionId = resultData?.session_id || sessionId || '';
-        const cost = resultData?.total_cost_usd ?? 0;
-
-        this.logger.info(
-          'claude',
-          `Response received (session=${resolvedSessionId}, cost=$${cost.toFixed(4)}, duration=${duration}ms)`,
-        );
-
-        resolve({
-          text,
-          sessionId: resolvedSessionId,
-          cost,
-          duration,
-          toolCalls,
-        });
-      });
-
-      proc.on('error', (err) => {
-        clearTimeout(timeoutTimer);
-        clearTimeout(startupTimeout);
-        this.activeProcess = null;
-        this.logger.error('claude', `Failed to spawn claude: ${err.message}`);
-        this.emit('error', err);
-        reject(err);
-      });
-    });
-  }
-
-  /**
-   * Build the CLI argument array for the claude subprocess.
-   *
-   * @param {string|null} sessionId - Session ID for continuation, or null for new
-   * @param {string} systemPrompt - System prompt for new sessions
-   * @param {object} [options={}]
-   * @param {boolean} [options.skipMcp=false] - Omit MCP config and allowed-tools args
-   * @returns {string[]}
-   * @private
-   */
-  _buildArgs(sessionId, systemPrompt, { skipMcp = false } = {}) {
-    const args = ['-p', '--output-format', 'stream-json', '--verbose', '--permission-mode', 'bypassPermissions'];
-
-    if (sessionId) {
-      // Continuation: resume an existing session
-      args.push('--resume', sessionId);
-    } else {
-      // New session: full configuration
-      args.push('--model', this.config.CLAUDE_MODEL);
-
-      if (systemPrompt) {
-        args.push('--system-prompt', systemPrompt);
-      }
-
-      if (!skipMcp && this.config.MCP_CONFIG_PATH) {
-        args.push('--mcp-config', this.config.MCP_CONFIG_PATH);
-        args.push('--allowed-tools', this.config.MCP_TOOLS_WHITELIST);
-      }
-
-      const settingsPath = path.join(
-        this.config.DATA_DIR, 'claude-runtime', '.claude', 'settings.json',
-      );
-      args.push('--settings', settingsPath);
-
-      if (this.config.CLAUDE_MAX_BUDGET) {
-        args.push('--max-budget-usd', this.config.CLAUDE_MAX_BUDGET);
-      }
-    }
-
-    return args;
-  }
-
-  /**
-   * Validate MCP config file before spawning. Logs diagnostics for common
-   * issues (missing file, npx-based servers that may download on first run).
-   * Does NOT block the spawn -- purely diagnostic.
-   * @private
-   */
-  _validateMcpConfig() {
-    const configPath = this.config.MCP_CONFIG_PATH;
-    if (!configPath) {
-      this.logger.info('claude', 'No MCP_CONFIG_PATH configured; skipping MCP config validation');
-      return;
+      }, mcpInitTimeout);
     }
 
     try {
-      const raw = fs.readFileSync(configPath, 'utf-8');
-      const parsed = JSON.parse(raw);
-      const servers = parsed.mcpServers || {};
-      const serverNames = Object.keys(servers);
+      // Build SDK options
+      const options = {
+        model: this.config.CLAUDE_MODEL,
+        permissionMode: 'bypassPermissions',
+        allowDangerouslySkipPermissions: true,
+        cwd: runtimeDir,
+        settingSources: ['project'], // Load skills from .claude/skills/
+        abortController: this._abortController,
+        hooks: this._buildHooks(),
+        includePartialMessages: true, // For typing indicator events
+      };
 
-      this.logger.info('claude', `MCP config: ${configPath} (${serverNames.length} server(s): ${serverNames.join(', ')})`);
+      if (sessionId) {
+        options.resume = sessionId;
+      } else {
+        if (systemPrompt) {
+          options.systemPrompt = systemPrompt;
+        }
+        if (!skipMcp) {
+          options.mcpServers = this._buildMcpServers();
+        }
+        options.allowedTools = this._buildAllowedTools(skipMcp);
+      }
 
-      for (const [name, server] of Object.entries(servers)) {
-        if (server.command === 'npx') {
-          this.logger.info('claude', `MCP server "${name}" uses npx -- first-run download may cause startup delay`);
+      if (this.config.CLAUDE_MAX_BUDGET) {
+        options.maxBudgetUsd = parseFloat(this.config.CLAUDE_MAX_BUDGET);
+      }
+
+      this.logger.info('claude', `SDK query starting (session=${sessionId || 'new'}, model=${this.config.CLAUDE_MODEL}, mcp=${!skipMcp})`);
+
+      const textChunks = [];
+      const toolCalls = [];
+      let resultData = null;
+      let resolvedSessionId = sessionId || '';
+
+      const q = query({ prompt: message, options });
+
+      for await (const msg of q) {
+        // Mark first message received (for MCP init timeout)
+        if (!receivedFirstMessage) {
+          receivedFirstMessage = true;
+          if (mcpInitTimer) clearTimeout(mcpInitTimer);
+          this.logger.info('claude', `First SDK message received after ${Date.now() - startTime}ms`);
+        }
+
+        switch (msg.type) {
+          case 'system': {
+            if (msg.subtype === 'init' && msg.session_id) {
+              resolvedSessionId = msg.session_id;
+            }
+            break;
+          }
+
+          case 'assistant': {
+            // Extract text from assistant message content blocks
+            const content = msg.message?.content;
+            if (Array.isArray(content)) {
+              for (const block of content) {
+                if (block.type === 'text' && block.text) {
+                  textChunks.push(block.text);
+                }
+                if (block.type === 'tool_use') {
+                  toolCalls.push({
+                    id: block.id,
+                    name: block.name,
+                    input: block.input,
+                  });
+                }
+              }
+            }
+            this.emit('typing');
+            break;
+          }
+
+          case 'stream_event': {
+            // Incremental streaming tokens
+            if (msg.event?.type === 'content_block_delta' &&
+                msg.event?.delta?.type === 'text_delta' &&
+                msg.event?.delta?.text) {
+              // Don't push partial text -- it's already included in the full assistant message
+              // Just use for typing indicator
+            }
+            this.emit('typing');
+            break;
+          }
+
+          case 'result': {
+            resultData = msg;
+            // Extract any remaining text from the result
+            if (msg.result && typeof msg.result === 'string') {
+              // SDK result messages include the final text in msg.result
+              // Only use it if we didn't collect text from assistant messages
+              if (textChunks.length === 0) {
+                textChunks.push(msg.result);
+              }
+            }
+            if (msg.session_id) {
+              resolvedSessionId = msg.session_id;
+            }
+            break;
+          }
+
+          default:
+            this.logger.debug('claude', `SDK message type: ${msg.type}${msg.subtype ? '/' + msg.subtype : ''}`);
+            break;
         }
       }
+
+      clearTimeout(timeoutTimer);
+      if (mcpInitTimer) clearTimeout(mcpInitTimer);
+
+      const duration = Date.now() - startTime;
+      const text = textChunks.join('');
+      const cost = resultData?.total_cost_usd ?? 0;
+
+      // If we got a result message with text but no assistant chunks, use the result text
+      if (!text && resultData?.result && typeof resultData.result === 'string') {
+        textChunks.push(resultData.result);
+      }
+
+      this.logger.info(
+        'claude',
+        `Response received (session=${resolvedSessionId}, cost=$${cost.toFixed(4)}, duration=${duration}ms)`,
+      );
+
+      return {
+        text: textChunks.join('') || text,
+        sessionId: resolvedSessionId,
+        cost,
+        duration,
+        toolCalls,
+      };
     } catch (err) {
-      this.logger.warn('claude', `MCP config validation failed (${configPath}): ${err.message}`);
+      clearTimeout(timeoutTimer);
+      if (mcpInitTimer) clearTimeout(mcpInitTimer);
+
+      // If MCP init timed out, tag the error for the retry logic in invoke()
+      if (mcpTimedOut) {
+        const mcpErr = new Error(
+          `MCP initialization timed out after ${mcpInitTimeout}ms -- ` +
+          'MCP servers failed to start. Consider pre-installing: ' +
+          'npm install -g @modelcontextprotocol/server-postgres',
+        );
+        mcpErr.mcpTimeout = true;
+        throw mcpErr;
+      }
+
+      // Check if this was our timeout abort
+      if (err.name === 'AbortError' || this._abortController?.signal.aborted) {
+        throw new Error(`Claude SDK query timed out after ${effectiveTimeout}ms`);
+      }
+
+      this.logger.error('claude', `SDK query failed: ${err.message}`);
+      this.emit('error', err);
+      throw err;
+    } finally {
+      this._active = false;
+      this._abortController = null;
     }
   }
 
   /**
-   * Handle a single parsed stream-json chunk.
-   *
-   * Stream-json output consists of objects with a `type` field:
-   * - "assistant": contains text content chunks
-   * - "result": final object with session_id, total_cost_usd, usage
-   * - "tool_use": tool invocation records
-   *
-   * @param {object} chunk - Parsed JSON chunk
-   * @param {string[]} textChunks - Accumulator for assistant text
-   * @param {Array} toolCalls - Accumulator for tool call records
-   * @private
-   */
-  _handleStreamChunk(chunk, textChunks, toolCalls) {
-    switch (chunk.type) {
-      case 'assistant': {
-        // Extract text content from assistant messages
-        const content = chunk.message?.content;
-        if (Array.isArray(content)) {
-          for (const block of content) {
-            if (block.type === 'text' && block.text) {
-              textChunks.push(block.text);
-            }
-          }
-        } else if (typeof content === 'string') {
-          textChunks.push(content);
-        }
-
-        // Emit typing event so Telegram adapter can refresh the indicator
-        this.emit('typing');
-        break;
-      }
-
-      case 'content_block_delta': {
-        // Incremental text deltas during streaming
-        if (chunk.delta?.type === 'text_delta' && chunk.delta.text) {
-          textChunks.push(chunk.delta.text);
-        }
-        this.emit('typing');
-        break;
-      }
-
-      case 'tool_use': {
-        toolCalls.push({
-          id: chunk.id,
-          name: chunk.name,
-          input: chunk.input,
-        });
-        break;
-      }
-
-      case 'result': {
-        // Final result object -- extract any remaining text from the result
-        const resultContent = chunk.result?.content;
-        if (Array.isArray(resultContent)) {
-          for (const block of resultContent) {
-            if (block.type === 'text' && block.text) {
-              textChunks.push(block.text);
-            }
-          }
-        }
-        break;
-      }
-
-      default:
-        // Other chunk types (e.g., "system", "thinking") are logged at debug level
-        this.logger.debug('claude', `Stream chunk type: ${chunk.type}`);
-        break;
-    }
-  }
-
-  /**
-   * Returns true if a Claude subprocess is currently running.
+   * Returns true if a Claude SDK query is currently running.
    * @returns {boolean}
    */
   isActive() {
-    return this.activeProcess !== null && this.activeProcess.exitCode === null;
+    return this._active;
   }
 
   /**
-   * Kill the active Claude subprocess, if any.
+   * Abort the active Claude SDK query, if any.
    */
   kill() {
-    if (this.activeProcess && this.activeProcess.exitCode === null) {
-      this.logger.warn('claude', 'Killing active subprocess');
-      this.activeProcess.kill('SIGTERM');
-      this.activeProcess = null;
+    if (this._active && this._abortController) {
+      this.logger.warn('claude', 'Aborting active SDK query');
+      this._abortController.abort();
+      this._active = false;
+      this._abortController = null;
     }
   }
 }

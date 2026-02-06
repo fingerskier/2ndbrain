@@ -2,7 +2,7 @@
  * Conversation manager (spec section 6).
  *
  * Persists all conversation turns to the conversation_messages table,
- * manages Claude CLI sessions, and controls history size through
+ * manages Claude sessions, and controls history size through
  * auto-compaction.
  */
 class ConversationManager {
@@ -17,7 +17,7 @@ class ConversationManager {
     this.logger = logger;
     this.config = config;
 
-    /** @type {string|null} Active Claude CLI session ID */
+    /** @type {string|null} Active Claude session ID */
     this.currentSessionId = null;
   }
 
@@ -102,7 +102,7 @@ class ConversationManager {
 
   /**
    * Update the current session ID (typically called after receiving
-   * the session_id from a Claude CLI result).
+   * the session_id from a Claude SDK result).
    *
    * @param {string} id - The Claude CLI session ID
    */
@@ -114,7 +114,7 @@ class ConversationManager {
   /**
    * Auto-compact conversation history when it exceeds the configured threshold.
    *
-   * Compaction only runs when no Claude subprocess is active (prevents race
+   * Compaction only runs when no Claude query is active (prevents race
    * conditions). Old messages are summarized via Claude and replaced with a
    * single summary message, keeping the 20 most recent messages intact.
    *
@@ -124,7 +124,7 @@ class ConversationManager {
   async compact(claudeBridge) {
     // Guard: do not compact while Claude is processing a request
     if (claudeBridge.isActive()) {
-      this.logger.debug('conversation', 'Skipping compaction: Claude subprocess is active');
+      this.logger.debug('conversation', 'Skipping compaction: Claude query is active');
       return false;
     }
 

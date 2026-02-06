@@ -1,17 +1,17 @@
-import { spawn } from 'node:child_process';
-import fs from 'node:fs';
+import { query } from '@anthropic-ai/claude-code';
 import os from 'node:os';
 import path from 'node:path';
 
 /**
- * Run a lightweight self-test of Claude CLI and MCP server connectivity.
+ * Run a lightweight self-test of the Claude SDK and MCP server connectivity.
  *
  * Tests are run sequentially:
- *   1. Bare Claude CLI (no MCP) — validates API connectivity
- *   2. Claude CLI with MCP config — validates full integration
+ *   1. Bare SDK query (no MCP) -- validates API connectivity
+ *   2. Individual MCP server probes -- validates server reachability
+ *   3. SDK query with MCP config -- validates full integration
  *
  * Results are logged and returned for use by the /health endpoint.
- * This function is non-blocking to startup — callers should fire-and-forget.
+ * This function is non-blocking to startup -- callers should fire-and-forget.
  *
  * @param {object} options
  * @param {object} options.config - Application configuration
@@ -37,106 +37,100 @@ async function runSelfTest({ config, logger }) {
 
   const runtimeDir = path.join(config.DATA_DIR, 'claude-runtime');
 
-  logger.info('self-test', 'Starting Claude CLI self-test...');
+  logger.info('self-test', 'Starting Claude SDK self-test...');
 
-  // --- Test 1: Bare Claude CLI (no MCP) ---
+  // --- Test 1: Bare SDK query (no MCP) ---
   try {
     const start = Date.now();
-    await spawnTest({
-      command: config.CLAUDE_COMMAND || 'claude',
-      args: ['-p', '--output-format', 'stream-json', '--verbose', '--model', config.CLAUDE_MODEL],
+    await sdkTest({
+      model: config.CLAUDE_MODEL,
       message: 'respond with just the word ok',
       cwd: runtimeDir,
       timeout: 30_000,
     });
     results.cliResponseMs = Date.now() - start;
     results.cliOk = true;
-    logger.info('self-test', `Claude CLI (no MCP): OK in ${results.cliResponseMs}ms`);
+    logger.info('self-test', `Claude SDK (no MCP): OK in ${results.cliResponseMs}ms`);
   } catch (err) {
     results.cliResponseMs = 0;
-    logger.error('self-test', `Claude CLI (no MCP): FAILED -- ${err.message}`);
+    logger.error('self-test', `Claude SDK (no MCP): FAILED -- ${err.message}`);
   }
 
   // --- Test 2: Individual MCP server probes ---
-  if (config.MCP_CONFIG_PATH) {
-    try {
-      const raw = fs.readFileSync(config.MCP_CONFIG_PATH, 'utf-8');
-      const mcpConfig = JSON.parse(raw);
-      const servers = mcpConfig.mcpServers || {};
+  // Build the MCP servers config the same way the bridge does
+  const mcpServers = {};
+  if (config.DATABASE_URL) {
+    mcpServers.pg = {
+      command: 'npx',
+      args: ['-y', '@modelcontextprotocol/server-postgres', config.DATABASE_URL],
+    };
+  }
+  if (config.EMBEDDING_PROVIDER && config._embedServerUrl) {
+    mcpServers.embed = {
+      type: 'url',
+      url: config._embedServerUrl,
+    };
+  }
 
-      for (const [name, server] of Object.entries(servers)) {
-        const start = Date.now();
-        try {
-          if (server.command) {
-            // Command-based server: check if the process starts and produces output
-            await spawnTest({
-              command: server.command,
-              args: server.args || [],
-              cwd: runtimeDir,
-              timeout: 15_000,
-              expectOutput: false, // just check if it starts without crashing
-            });
-            results.mcpServers[name] = {
-              ok: true,
-              responseMs: Date.now() - start,
-            };
-            logger.info('self-test', `MCP server "${name}": started in ${Date.now() - start}ms`);
-          } else if (server.type === 'url' && server.url) {
-            // URL-based server: check if it responds to HTTP
-            const response = await fetch(server.url, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ jsonrpc: '2.0', method: 'initialize', id: 1, params: {} }),
-              signal: AbortSignal.timeout(5_000),
-            });
-            results.mcpServers[name] = {
-              ok: response.ok,
-              responseMs: Date.now() - start,
-            };
-            logger.info('self-test', `MCP server "${name}" (url): ${response.ok ? 'OK' : 'FAILED'} in ${Date.now() - start}ms`);
-          }
-        } catch (err) {
-          results.mcpServers[name] = {
-            ok: false,
-            responseMs: Date.now() - start,
-            error: err.message,
-          };
-          logger.warn('self-test', `MCP server "${name}": FAILED -- ${err.message}`);
-        }
+  for (const [name, server] of Object.entries(mcpServers)) {
+    const start = Date.now();
+    try {
+      if (server.type === 'url' && server.url) {
+        // URL-based server: check if it responds to HTTP
+        const response = await fetch(server.url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ jsonrpc: '2.0', method: 'initialize', id: 1, params: {} }),
+          signal: AbortSignal.timeout(5_000),
+        });
+        results.mcpServers[name] = {
+          ok: response.ok,
+          responseMs: Date.now() - start,
+        };
+        logger.info('self-test', `MCP server "${name}" (url): ${response.ok ? 'OK' : 'FAILED'} in ${Date.now() - start}ms`);
+      } else if (server.command) {
+        // Command-based server: just record that it's configured
+        // (The SDK manages server lifecycle; we can't probe it in isolation
+        // without spawning it, which is what Test 3 validates)
+        results.mcpServers[name] = {
+          ok: true,
+          responseMs: 0,
+          note: 'command-based server; validated via full integration test',
+        };
+        logger.info('self-test', `MCP server "${name}": command-based, will validate in integration test`);
       }
     } catch (err) {
-      logger.warn('self-test', `Could not read MCP config for server probes: ${err.message}`);
+      results.mcpServers[name] = {
+        ok: false,
+        responseMs: Date.now() - start,
+        error: err.message,
+      };
+      logger.warn('self-test', `MCP server "${name}": FAILED -- ${err.message}`);
     }
   }
 
-  // --- Test 3: Full integration (Claude + MCP) ---
-  if (results.cliOk && config.MCP_CONFIG_PATH) {
+  // --- Test 3: Full integration (SDK + MCP) ---
+  if (results.cliOk && Object.keys(mcpServers).length > 0) {
     try {
       const start = Date.now();
-      const args = [
-        '-p', '--output-format', 'stream-json',
-        '--model', config.CLAUDE_MODEL,
-        '--mcp-config', config.MCP_CONFIG_PATH,
-        '--permission-mode', 'bypassPermissions',
-      ];
-      await spawnTest({
-        command: config.CLAUDE_COMMAND || 'claude',
-        args,
+      await sdkTest({
+        model: config.CLAUDE_MODEL,
         message: 'respond with just the word ok',
         cwd: runtimeDir,
         timeout: 45_000,
+        mcpServers,
       });
       results.fullIntegrationMs = Date.now() - start;
       results.fullIntegrationOk = true;
-      logger.info('self-test', `Claude CLI (with MCP): OK in ${results.fullIntegrationMs}ms`);
+      logger.info('self-test', `Claude SDK (with MCP): OK in ${results.fullIntegrationMs}ms`);
     } catch (err) {
       results.fullIntegrationMs = 0;
-      logger.warn('self-test', `Claude CLI (with MCP): FAILED -- ${err.message}`);
+      logger.warn('self-test', `Claude SDK (with MCP): FAILED -- ${err.message}`);
 
       if (results.cliOk) {
         logger.warn(
           'self-test',
-          'Claude CLI works WITHOUT MCP servers but FAILS with MCP config. ' +
+          'Claude SDK works WITHOUT MCP servers but FAILS with MCP config. ' +
           'The MCP servers are the problem. Consider pre-installing: ' +
           'npm install -g @modelcontextprotocol/server-postgres',
         );
@@ -144,93 +138,56 @@ async function runSelfTest({ config, logger }) {
     }
   }
 
-  logger.info('self-test', `Self-test complete: cli=${results.cliOk}, mcp_integration=${results.fullIntegrationOk}`);
+  logger.info('self-test', `Self-test complete: sdk=${results.cliOk}, mcp_integration=${results.fullIntegrationOk}`);
   return results;
 }
 
 /**
- * Spawn a process and wait for first stdout or completion.
+ * Run a minimal SDK query and wait for any response.
  *
  * @param {object} options
- * @param {string} [options.command='claude'] - Command to run
- * @param {string[]} options.args - Arguments
- * @param {string} [options.message] - Message to pipe via stdin
+ * @param {string} options.model - Claude model to use
+ * @param {string} options.message - Message to send
  * @param {string} options.cwd - Working directory
  * @param {number} options.timeout - Timeout in ms
- * @param {boolean} [options.expectOutput=true] - Whether to wait for stdout
- * @returns {Promise<string>} First stdout output
+ * @param {object} [options.mcpServers] - Optional MCP server config
+ * @returns {Promise<string>} First text response
  */
-function spawnTest({ command = 'claude', args, message, cwd, timeout, expectOutput = true }) {
-  return new Promise((resolve, reject) => {
-    // On Windows, use claude.cmd for proper execution
-    const effectiveCommand = (command === 'claude' && process.platform === 'win32') ? 'claude.cmd' : command;
-    const spawnOptions = {
-      stdio: ['pipe', 'pipe', 'pipe'],
+async function sdkTest({ model, message, cwd, timeout, mcpServers }) {
+  const abortController = new AbortController();
+  const timer = setTimeout(() => abortController.abort(), timeout);
+
+  try {
+    const options = {
+      model,
       cwd,
-      env: { ...process.env },
+      permissionMode: 'bypassPermissions',
+      allowDangerouslySkipPermissions: true,
+      abortController,
+      maxTurns: 1,
     };
-    // On Windows, .cmd files require shell:true
-    if (process.platform === 'win32') {
-      spawnOptions.shell = true;
-    }
-    const proc = spawn(effectiveCommand, args, spawnOptions);
 
-    let stdout = '';
-    let stderr = '';
-    let done = false;
-
-    const timer = setTimeout(() => {
-      if (!done) {
-        done = true;
-        proc.kill('SIGTERM');
-        reject(new Error(`Timed out after ${timeout}ms (no output)`));
-      }
-    }, timeout);
-
-    if (message) {
-      proc.stdin.write(message);
-      proc.stdin.end();
-    } else {
-      proc.stdin.end();
+    if (mcpServers) {
+      options.mcpServers = mcpServers;
     }
 
-    proc.stdout.on('data', (chunk) => {
-      stdout += chunk.toString();
-      if (expectOutput && !done) {
-        done = true;
+    for await (const msg of query({ prompt: message, options })) {
+      if (msg.type === 'assistant' || msg.type === 'result') {
         clearTimeout(timer);
-        // Got output — kill the process (we don't need the full response)
-        proc.kill('SIGTERM');
-        resolve(stdout);
+        // Got a response -- test passed
+        const text = msg.type === 'result'
+          ? (msg.result || '')
+          : JSON.stringify(msg.message?.content || '');
+        return text;
       }
-    });
+    }
 
-    proc.stderr.on('data', (chunk) => {
-      stderr += chunk.toString();
-    });
-
-    proc.on('close', (code) => {
-      clearTimeout(timer);
-      if (!done) {
-        done = true;
-        if (code === 0 || stdout) {
-          resolve(stdout);
-        } else {
-          reject(new Error(
-            `Process exited with code ${code}${stderr ? ': ' + stderr.trim().slice(-200) : ''}`,
-          ));
-        }
-      }
-    });
-
-    proc.on('error', (err) => {
-      clearTimeout(timer);
-      if (!done) {
-        done = true;
-        reject(err);
-      }
-    });
-  });
+    clearTimeout(timer);
+    return '';
+  } catch (err) {
+    clearTimeout(timer);
+    throw err;
+  }
 }
 
 export { runSelfTest };

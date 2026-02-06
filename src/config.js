@@ -39,13 +39,11 @@ const config = {
   CLAUDE_TIMEOUT: parseInt(env.CLAUDE_TIMEOUT, 10) || 120000,
   MCP_INIT_TIMEOUT: parseInt(env.MCP_INIT_TIMEOUT, 10) || 30000,
   CLAUDE_MAX_BUDGET: env.CLAUDE_MAX_BUDGET || '',
-  CLAUDE_COMMAND: null, // Set at runtime after path resolution
 
   // Storage
   DATA_DIR: env.DATA_DIR || path.join(os.homedir(), 'data'),
 
   // MCP
-  MCP_CONFIG_PATH: env.MCP_CONFIG_PATH || path.join(os.homedir(), '.claude', 'mcp.json'),
   MCP_TOOLS_WHITELIST: env.MCP_TOOLS_WHITELIST || '*',
   COMMANDS_WHITELIST: env.COMMANDS_WHITELIST || '',
 
