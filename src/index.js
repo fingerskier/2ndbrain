@@ -37,6 +37,7 @@ import { EmbeddingWorker } from './embeddings/worker.js';
 import { SchedulerWorker } from './scheduler/worker.js';
 import { WebServer } from './web/server.js';
 import { runSelfTest } from './claude/self-test.js';
+import { ActionTracker } from './actions/tracker.js';
 
 // ---------------------------------------------------------------------------
 // State
@@ -164,6 +165,7 @@ async function handleMessage(message, deps) {
     attachmentStore,
     rateLimiters,
     embeddingsEngine,
+    actionTracker,
   } = deps;
 
   const { chatId, text, attachments, messageId } = message;
@@ -171,6 +173,17 @@ async function handleMessage(message, deps) {
   // 1. Check if it's a slash command
   const handled = await commandRouter.route(message);
   if (handled) return;
+
+  // Track inbound message
+  if (actionTracker) {
+    await actionTracker.messageReceived({
+      chatId,
+      userId: message.userId,
+      messageId,
+      hasAttachments: attachments && attachments.length > 0,
+      textLength: (text || '').length,
+    });
+  }
 
   // 2. Save user message
   const savedUserMsg = await conversationManager.saveMessage('user', text || '', {
@@ -186,6 +199,12 @@ async function handleMessage(message, deps) {
           { file_id: att.fileId, mime_type: att.mimeType },
           savedUserMsg.id,
         );
+        if (actionTracker) {
+          await actionTracker.attachmentSaved({
+            messageId: savedUserMsg.id,
+            mimeType: att.mimeType,
+          });
+        }
       } catch (err) {
         logger.error('attachments', `Failed to save attachment: ${err.message}`);
       }
@@ -219,11 +238,24 @@ async function handleMessage(message, deps) {
     const ctx = preResult.context || {};
 
     // 7. Invoke Claude
+    const claudeStart = Date.now();
     const result = await claudeBridge.invoke(
       text || '',
       conversationManager.currentSessionId,
       ctx.systemPrompt || '',
     );
+
+    // Track successful Claude invocation
+    if (actionTracker) {
+      await actionTracker.claudeInvoked({
+        sessionId: result.sessionId,
+        cost: result.cost,
+        duration: result.duration,
+        toolCallCount: result.toolCalls?.length || 0,
+        responseLength: (result.text || '').length,
+        mcpFallback: result._mcpFallback,
+      });
+    }
 
     // 8. Update session ID
     if (result.sessionId) {
@@ -260,7 +292,9 @@ async function handleMessage(message, deps) {
     // 12. Stop typing and send response
     bot.stopTyping(chatId);
 
+    let chunkCount = 1;
     if (sendCtx.chunks && sendCtx.chunks.length > 0) {
+      chunkCount = sendCtx.chunks.length;
       for (let i = 0; i < sendCtx.chunks.length; i++) {
         await bot.sendMessage(chatId, sendCtx.chunks[i], {
           reply_to_message_id: i === 0 ? messageId : undefined,
@@ -272,6 +306,15 @@ async function handleMessage(message, deps) {
       });
     }
 
+    // Track outbound message
+    if (actionTracker) {
+      await actionTracker.messageSent({
+        chatId,
+        chunks: chunkCount,
+        responseLength: (result.text || '').length,
+      });
+    }
+
     // 13. Attempt auto-compaction (non-blocking)
     conversationManager.compact(claudeBridge).catch((err) => {
       logger.warn('conversation', `Auto-compaction error: ${err.message}`);
@@ -280,8 +323,16 @@ async function handleMessage(message, deps) {
     bot.stopTyping(chatId);
     logger.error('message-handler', `Error processing message: ${err.message}`);
 
-    // Notify user of the error
+    // Track error
     const isTimeout = err.message?.includes('timed out');
+    if (actionTracker) {
+      await actionTracker.claudeError({
+        error: err.message,
+        isTimeout,
+      });
+    }
+
+    // Notify user of the error
     const userMessage = isTimeout
       ? 'Response timed out, please try again.'
       : `Sorry, an error occurred: ${err.message}`;
@@ -456,6 +507,9 @@ async function main() {
 
   const claudeBridge = new ClaudeBridge({ config, logger, hooks });
 
+  // Create action tracker for structured action logging
+  const actionTracker = dbReady ? new ActionTracker({ db: { query }, logger }) : null;
+
   // Register lifecycle hooks
   hooks.registerDefaults({
     logger,
@@ -467,7 +521,7 @@ async function main() {
   });
 
   // Step 6: Start web admin server
-  webServer = new WebServer({ config, db: { query }, logger, claudeBridge });
+  webServer = new WebServer({ config, db: { query }, logger, claudeBridge, actionTracker });
   try {
     await webServer.start();
   } catch (err) {
@@ -494,6 +548,7 @@ async function main() {
       bot,
       logger,
       conversationManager,
+      actionTracker,
       processInfo: {
         startTime,
         getMessageCount: () => conversationManager.getMessageCount(),
@@ -531,6 +586,7 @@ async function main() {
       attachmentStore,
       rateLimiters,
       embeddingsEngine,
+      actionTracker,
     };
 
     // Catch emitted errors so they don't throw (Node.js EventEmitter behaviour)
@@ -566,6 +622,7 @@ async function main() {
       claudeBridge,
       bot,
       rateLimiters,
+      actionTracker,
     });
     schedulerWorker.start();
   }
