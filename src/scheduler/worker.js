@@ -65,13 +65,14 @@ class SchedulerWorker {
    * @param {import('../telegram/bot.js').TelegramBot} deps.bot - Telegram bot instance
    * @param {object} deps.rateLimiters  - { claude: RateLimiter, ... }
    */
-  constructor({ db, config, logger, claudeBridge, bot, rateLimiters }) {
+  constructor({ db, config, logger, claudeBridge, bot, rateLimiters, actionTracker = null }) {
     this.db = db;
     this.config = config;
     this.logger = logger;
     this.claudeBridge = claudeBridge;
     this.bot = bot;
     this.rateLimiters = rateLimiters;
+    this.actionTracker = actionTracker;
 
     /** @type {ReturnType<typeof setTimeout>|null} */
     this._timer = null;
@@ -242,6 +243,7 @@ class SchedulerWorker {
    */
   async _executeTask(row) {
     const { id, chat_id, cron_expression, task_prompt, description, timezone, error_count } = row;
+    const taskStart = Date.now();
 
     try {
       // Respect the Claude rate limiter
@@ -276,6 +278,15 @@ class SchedulerWorker {
       );
 
       this.logger.info('scheduler', `Task ${id} ("${description}") executed. Next run: ${nextRun?.toISOString() || 'none'}`);
+
+      // Track successful scheduled task execution
+      if (this.actionTracker) {
+        await this.actionTracker.scheduledTaskRun({
+          taskId: id,
+          description,
+          duration: Date.now() - taskStart,
+        });
+      }
     } catch (err) {
       // Record the error and possibly auto-disable
       const newErrorCount = error_count + 1;
@@ -309,6 +320,17 @@ class SchedulerWorker {
             { parse_mode: undefined },
           );
         } catch { /* best-effort notification */ }
+      }
+
+      // Track failed scheduled task execution
+      if (this.actionTracker) {
+        await this.actionTracker.scheduledTaskRun({
+          taskId: id,
+          description,
+          duration: Date.now() - taskStart,
+          status: 'error',
+          error: err.message,
+        });
       }
 
       throw err;

@@ -44,7 +44,7 @@ class CommandRouter {
    * @param {() => Promise<number>} deps.processInfo.getMessageCount - Async fn returning total message count
    * @param {() => Promise<object>} deps.processInfo.getHealthStatus - Async fn returning component health
    */
-  constructor({ bot, logger, conversationManager, processInfo }) {
+  constructor({ bot, logger, conversationManager, processInfo, actionTracker = null }) {
     /** @type {import('./bot.js').TelegramBot} */
     this._bot = bot;
 
@@ -56,6 +56,9 @@ class CommandRouter {
 
     /** @type {object} */
     this._processInfo = processInfo;
+
+    /** @type {import('../actions/tracker.js').ActionTracker|null} */
+    this._actionTracker = actionTracker;
 
     /**
      * Pending confirmations keyed by chatId.
@@ -139,6 +142,10 @@ class CommandRouter {
             replyOpts,
           );
           break;
+      }
+      // Track command execution
+      if (this._actionTracker) {
+        await this._actionTracker.commandExecuted({ command, chatId });
       }
     } catch (err) {
       this._logger.error('commands', `Error handling ${command}: ${err.message}`);

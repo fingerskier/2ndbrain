@@ -104,11 +104,12 @@ class WebServer {
    * @param {object}  opts.logger - Logger instance with info/warn/error methods
    * @param {object}  [opts.claudeBridge] - ClaudeBridge instance for diagnostics
    */
-  constructor({ config, db, logger, claudeBridge = null }) {
+  constructor({ config, db, logger, claudeBridge = null, actionTracker = null }) {
     this._config = config;
     this._db = db;
     this._logger = logger;
     this._claudeBridge = claudeBridge;
+    this._actionTracker = actionTracker;
     this._server = null;
     this._app = null;
     this._envPath = ENV_PATH;
@@ -133,6 +134,7 @@ class WebServer {
     app.get('/logs', (req, res) => this._handleLogs(req, res));
     app.get('/health', (req, res) => this._handleHealth(req, res));
     app.get('/diagnose', (req, res) => this._handleDiagnose(req, res));
+    app.get('/actions', (req, res) => this._handleActions(req, res));
     app.get('/database', (req, res) => this._handleDatabase(req, res));
     app.post('/database/migrate', (req, res) => this._handleRunMigrations(req, res));
 
@@ -229,6 +231,21 @@ class WebServer {
         );
         data.recentErrors = errors.rows;
       } catch { /* leave empty */ }
+
+      // Bot action stats (last 24h) -- graceful if table doesn't exist yet
+      try {
+        const actionStats = await this._db.query(
+          `SELECT
+             COUNT(*)::int AS total,
+             COUNT(*) FILTER (WHERE status = 'error')::int AS errors,
+             COUNT(*) FILTER (WHERE action = 'claude_invoked' AND status = 'ok')::int AS claude_calls,
+             ROUND(AVG(duration_ms) FILTER (WHERE action = 'claude_invoked' AND status = 'ok'))::int AS avg_claude_ms,
+             COALESCE(SUM((detail->>'cost_usd')::numeric) FILTER (WHERE detail->>'cost_usd' IS NOT NULL), 0) AS total_cost
+           FROM bot_actions
+           WHERE created_at > NOW() - INTERVAL '24 hours'`,
+        );
+        data.actionStats = actionStats.rows[0] || null;
+      } catch { /* table may not exist yet */ }
     }
 
     res.send(dashboardHTML(data));
@@ -385,6 +402,71 @@ class WebServer {
       this._logger.error('web', `Diagnostics failed: ${err.message}`);
       res.status(500).json({ error: err.message });
     }
+  }
+
+  // -----------------------------------------------------------------------
+  // Actions page
+  // -----------------------------------------------------------------------
+
+  async _handleActions(req, res) {
+    const filter = req.query.action || '';
+    const data = {
+      actions: [],
+      stats: { total: 0, errors: 0, avgDuration: 0, totalCost: 0 },
+      actionTypes: [],
+      activeFilter: filter,
+      dbAvailable: true,
+    };
+
+    try {
+      // Get action type counts for filter buttons
+      const typesResult = await this._db.query(
+        `SELECT action, COUNT(*)::int AS count
+         FROM bot_actions
+         GROUP BY action
+         ORDER BY count DESC`,
+      );
+      data.actionTypes = typesResult.rows;
+
+      // Get summary stats (last 24h)
+      const statsResult = await this._db.query(
+        `SELECT
+           COUNT(*)::int AS total,
+           COUNT(*) FILTER (WHERE status = 'error')::int AS errors,
+           ROUND(AVG(duration_ms) FILTER (WHERE duration_ms IS NOT NULL))::int AS avg_duration,
+           COALESCE(SUM((detail->>'cost_usd')::numeric) FILTER (WHERE detail->>'cost_usd' IS NOT NULL), 0) AS total_cost
+         FROM bot_actions
+         WHERE created_at > NOW() - INTERVAL '24 hours'`,
+      );
+      if (statsResult.rows[0]) {
+        data.stats = {
+          total: statsResult.rows[0].total || 0,
+          errors: statsResult.rows[0].errors || 0,
+          avgDuration: statsResult.rows[0].avg_duration || 0,
+          totalCost: parseFloat(statsResult.rows[0].total_cost) || 0,
+        };
+      }
+
+      // Get recent actions with optional filter
+      const validActions = data.actionTypes.map((t) => t.action);
+      let sql = `SELECT id, created_at, action, status, source, duration_ms, detail
+                 FROM bot_actions`;
+      const params = [];
+
+      if (filter && validActions.includes(filter)) {
+        sql += ' WHERE action = $1';
+        params.push(filter);
+      }
+
+      sql += ' ORDER BY created_at DESC LIMIT 100';
+      const actionsResult = await this._db.query(sql, params);
+      data.actions = actionsResult.rows;
+    } catch (err) {
+      data.dbAvailable = false;
+      this._logger.error('web', `Actions page error: ${err.message}`);
+    }
+
+    res.send(actionsHTML(data));
   }
 
   // -----------------------------------------------------------------------
@@ -954,6 +1036,7 @@ function layoutHTML(title, content) {
 <nav>
   <a class="brand" href="/">2ndbrain</a>
   <a href="/">Dashboard</a>
+  <a href="/actions">Actions</a>
   <a href="/settings">Settings</a>
   <a href="/logs">Logs</a>
   <a href="/database">Database</a>
@@ -1001,6 +1084,42 @@ function dashboardHTML(data) {
       </div>
     </div>
   </div>`;
+
+  // -- Action stats (last 24h) ---------------------------------------------
+  let actionStatsSection = '';
+  if (data.actionStats) {
+    const a = data.actionStats;
+    const costStr = a.total_cost ? `$${parseFloat(a.total_cost).toFixed(4)}` : '$0';
+    const avgStr = a.avg_claude_ms ? `${(a.avg_claude_ms / 1000).toFixed(1)}s` : '--';
+    actionStatsSection = `
+    <h2>Bot Activity <span class="muted" style="font-size:0.8rem;font-weight:400;">(last 24h)</span></h2>
+    <div class="grid">
+      <div class="card">
+        <div class="stat-label">Actions</div>
+        <div class="stat-value">${a.total}</div>
+      </div>
+      <div class="card">
+        <div class="stat-label">Errors</div>
+        <div class="stat-value"${a.errors > 0 ? ' style="color:#f85149;"' : ''}>${a.errors}</div>
+      </div>
+      <div class="card">
+        <div class="stat-label">Claude Calls</div>
+        <div class="stat-value">${a.claude_calls}</div>
+      </div>
+      <div class="card">
+        <div class="stat-label">Avg Response</div>
+        <div class="stat-value">${avgStr}</div>
+      </div>
+      <div class="card">
+        <div class="stat-label">API Cost</div>
+        <div class="stat-value">${costStr}</div>
+      </div>
+      <div class="card">
+        <div class="stat-label">Details</div>
+        <div class="stat-value small"><a href="/actions" style="color:#58a6ff;">View All</a></div>
+      </div>
+    </div>`;
+  }
 
   // -- DB warning ----------------------------------------------------------
   let dbWarn = '';
@@ -1063,6 +1182,7 @@ function dashboardHTML(data) {
     <h1>Dashboard</h1>
     ${dbWarn}
     ${stats}
+    ${actionStatsSection}
     ${messagesSection}
     ${errorsSection}
   `);
@@ -1319,6 +1439,121 @@ function databaseHTML(data) {
     ${pendingSection}
     ${appliedSection}
     ${tablesSection}
+  `);
+}
+
+/**
+ * Actions page showing bot action timeline with filtering and stats.
+ */
+function actionsHTML(data) {
+  if (!data.dbAvailable) {
+    return layoutHTML('Actions', `
+      <h1>Bot Actions</h1>
+      <div class="db-warn">Database is unavailable. Cannot retrieve action data.</div>
+    `);
+  }
+
+  // Stats grid
+  const avgStr = data.stats.avgDuration ? `${(data.stats.avgDuration / 1000).toFixed(1)}s` : '--';
+  const costStr = data.stats.totalCost ? `$${data.stats.totalCost.toFixed(4)}` : '$0';
+  const statsGrid = `
+  <div class="grid">
+    <div class="card">
+      <div class="stat-label">Actions (24h)</div>
+      <div class="stat-value">${data.stats.total}</div>
+    </div>
+    <div class="card">
+      <div class="stat-label">Errors (24h)</div>
+      <div class="stat-value"${data.stats.errors > 0 ? ' style="color:#f85149;"' : ''}>${data.stats.errors}</div>
+    </div>
+    <div class="card">
+      <div class="stat-label">Avg Duration</div>
+      <div class="stat-value">${avgStr}</div>
+    </div>
+    <div class="card">
+      <div class="stat-label">API Cost (24h)</div>
+      <div class="stat-value">${costStr}</div>
+    </div>
+  </div>`;
+
+  // Filter buttons
+  const allCount = data.actionTypes.reduce((sum, t) => sum + t.count, 0);
+  let filters = `<a href="/actions" class="${data.activeFilter === '' ? 'active' : ''}">All (${allCount})</a>`;
+  filters += data.actionTypes.map((t) => {
+    const cls = data.activeFilter === t.action ? ' active' : '';
+    const label = t.action.replace(/_/g, ' ');
+    return `<a href="/actions?action=${encodeURIComponent(t.action)}" class="${cls}">${esc(label)} (${t.count})</a>`;
+  }).join('');
+
+  // Action color map
+  const actionColors = {
+    message_received: '#58a6ff',
+    message_sent: '#3fb950',
+    claude_invoked: '#d2a8ff',
+    command_executed: '#d29922',
+    scheduled_task_run: '#79c0ff',
+    attachment_saved: '#8b949e',
+  };
+
+  // Action table
+  let tableBody;
+  if (data.actions.length > 0) {
+    tableBody = data.actions.map((a) => {
+      const detail = a.detail || {};
+      const color = actionColors[a.action] || '#c9d1d9';
+      const statusBadge = a.status === 'error'
+        ? '<span class="badge badge-error">error</span>'
+        : '<span class="badge badge-ok">ok</span>';
+      const durationStr = a.duration_ms != null ? `${(a.duration_ms / 1000).toFixed(1)}s` : '';
+
+      // Build detail string from JSONB
+      const detailParts = [];
+      if (detail.cost_usd != null) detailParts.push(`cost: $${Number(detail.cost_usd).toFixed(4)}`);
+      if (detail.tool_call_count != null) detailParts.push(`tools: ${detail.tool_call_count}`);
+      if (detail.response_length != null) detailParts.push(`response: ${detail.response_length} chars`);
+      if (detail.text_length != null) detailParts.push(`text: ${detail.text_length} chars`);
+      if (detail.command) detailParts.push(`${detail.command}`);
+      if (detail.description) detailParts.push(`${detail.description}`);
+      if (detail.chunks != null && detail.chunks > 1) detailParts.push(`${detail.chunks} chunks`);
+      if (detail.mime_type) detailParts.push(detail.mime_type);
+      if (detail.mcp_fallback) detailParts.push('mcp fallback');
+      if (detail.is_timeout) detailParts.push('timeout');
+      if (detail.error) detailParts.push(`err: ${String(detail.error).slice(0, 80)}`);
+      const detailStr = detailParts.join(' | ');
+
+      return `
+      <tr>
+        <td style="white-space:nowrap;">${fmtTime(a.created_at)}</td>
+        <td><span style="color:${color};">${esc(a.action.replace(/_/g, ' '))}</span></td>
+        <td>${statusBadge}</td>
+        <td>${esc(a.source || '')}</td>
+        <td style="white-space:nowrap;">${durationStr}</td>
+        <td class="muted" style="font-size:0.8rem;">${esc(detailStr)}</td>
+      </tr>`;
+    }).join('');
+  } else {
+    tableBody = `<tr><td colspan="6" class="empty">No actions recorded yet.</td></tr>`;
+  }
+
+  return layoutHTML('Actions', `
+    <h1>Bot Actions</h1>
+    ${statsGrid}
+    <div class="log-filters">${filters}</div>
+    <div class="card" style="overflow-x:auto;">
+      <table>
+        <thead>
+          <tr>
+            <th>Time</th>
+            <th>Action</th>
+            <th>Status</th>
+            <th>Source</th>
+            <th>Duration</th>
+            <th>Detail</th>
+          </tr>
+        </thead>
+        <tbody>${tableBody}</tbody>
+      </table>
+    </div>
   `);
 }
 
