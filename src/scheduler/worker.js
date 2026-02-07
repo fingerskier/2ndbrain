@@ -61,7 +61,7 @@ class SchedulerWorker {
    * @param {object} deps.db            - Database query interface ({ query(sql, params) })
    * @param {object} deps.config        - Application configuration
    * @param {object} deps.logger        - Logger instance
-   * @param {import('../claude/bridge.js').ClaudeBridge} deps.claudeBridge - Claude CLI bridge
+   * @param {import('../claude/bridge.js').ClaudeBridge} deps.claudeBridge - Claude SDK bridge
    * @param {import('../telegram/bot.js').TelegramBot} deps.bot - Telegram bot instance
    * @param {object} deps.rateLimiters  - { claude: RateLimiter, ... }
    */
@@ -182,7 +182,7 @@ class SchedulerWorker {
 
       // Skip if Claude is busy with a user message
       if (this.claudeBridge.isActive()) {
-        this.logger.debug('scheduler', 'Skipping tick: Claude subprocess is active.');
+        this.logger.debug('scheduler', 'Skipping tick: Claude query is active.');
         this._scheduleNext();
         return;
       }
